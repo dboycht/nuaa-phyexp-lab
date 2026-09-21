@@ -120,6 +120,50 @@ def _cmd_recon(args: argparse.Namespace) -> int:
                       use_saved_state=not args.no_saved_state)
 
 
+def _cmd_analyze(args: argparse.Namespace) -> int:
+    """分析采样样本：退课/被抢事件、空位存活时间、变动排行。"""
+    from . import analyze
+
+    if args.samples:
+        sample_paths = [Path(p) for p in args.samples]
+    else:
+        sample_dir = config.home_dir() / "samples"
+        sample_paths = sorted(sample_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    sample_paths = [p for p in sample_paths if p.is_file()]
+    if not sample_paths:
+        print(f"[错误] 没找到样本文件。请先跑 `python run.py watch`；"
+              f"样本目录：{config.home_dir() / 'samples'}", file=sys.stderr)
+        return 2
+
+    snap_dir = config.home_dir() / "snapshots"
+    meta = analyze.load_snapshot_meta(sorted(snap_dir.glob("*.json"))) if snap_dir.is_dir() else {}
+
+    report = analyze.build_report(sample_paths, meta)
+    print("=== 采集概览 ===")
+    for line in report.summary_lines():
+        print(line)
+    print(f"场次静态信息命中: {len(meta)} 个场次（来自 snapshot；缺则项目名显示为未采到）")
+
+    print()
+    print("=== 变化事件（最多列 20 条）===")
+    if report.events:
+        for event in report.events[:20]:
+            print(f"  {event.describe()}")
+        if len(report.events) > 20:
+            print(f"  …另有 {len(report.events) - 20} 条，见报告文件")
+    else:
+        print("  样本期内没有任何余量变化（两者都如实为 0，不代表接口有问题）")
+
+    markdown = analyze.render_markdown(report)
+    report_dir = config.home_dir() / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    out = report_dir / f"analysis-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+    out.write_text(markdown, encoding="utf-8")
+    print()
+    print(f"完整报告 → {out}")
+    return 0
+
+
 def _cmd_clock(args: argparse.Namespace) -> int:
     """时钟对时：测出「服务端 − 本地」偏移（抢课打点必须按服务端时刻）。"""
     from . import probe
@@ -477,6 +521,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_clock.add_argument("--samples", type=int, default=7, help="对时采样次数（默认 7）")
     p_clock.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10）")
 
+    p_analyze = sub.add_parser("analyze", help="分析采样样本：退课/被抢事件与空位存活时间")
+    p_analyze.add_argument("--samples", nargs="*", default=None,
+                           help="指定样本 JSONL 文件（默认取样本目录下全部）")
+
     p_grab = sub.add_parser("grab", help="抢课引擎：对时 + 预热 + 精确定时 + 预发射（当前默认演练）")
     p_grab.add_argument("--slot", required=True, help="目标场次 id（可逗号分隔多个）")
     p_grab.add_argument("--at", default=None, help="服务端墙上时刻 HH:MM:SS（今天）")
@@ -546,6 +594,7 @@ def main(argv: list[str] | None = None) -> int:
         "gui": _cmd_gui,
         "clock": _cmd_clock,
         "grab": _cmd_grab,
+        "analyze": _cmd_analyze,
         "stop": _cmd_stop,
         "logout": _cmd_logout,
     }
