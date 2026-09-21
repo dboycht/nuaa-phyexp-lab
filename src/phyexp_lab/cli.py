@@ -16,7 +16,7 @@ import datetime as dt
 import sys
 from pathlib import Path
 
-from . import __version__, config, scrub, session
+from . import __version__, config, probe, scrub, session
 from .session import PlaywrightMissingError, SessionError
 
 REPO_URL = "https://github.com/dboycht/nuaa-phyexp-lab"
@@ -120,6 +120,39 @@ def _cmd_recon(args: argparse.Namespace) -> int:
                       use_saved_state=not args.no_saved_state)
 
 
+def _cmd_probe(args: argparse.Namespace) -> int:
+    """只读连通性自检：脚本直连 API 到底行不行（决定抢课引擎形态）。"""
+    print(f"目标：GET {config.API_BASE}/{args.path.lstrip('/')}   （只读，无写操作）")
+    results = probe.probe_endpoint(path=args.path, timeout=args.timeout)
+    print(f"{'用例':34s} {'状态':>6s} {'耗时':>7s}  说明")
+    print("-" * 92)
+    for r in results:
+        status = "-" if r.status is None else str(r.status)
+        elapsed = "-" if r.elapsed_ms is None else f"{r.elapsed_ms}ms"
+        note = r.error or r.body_head[:44]
+        print(f"{r.case.name:34s} {status:>6s} {elapsed:>7s}  {note}")
+    print("-" * 92)
+    print(probe.verdict(results))
+
+    if args.repeat > 0:
+        print()
+        print(f"稳态延迟测量：同一条 keep-alive 会话连发 {args.repeat} 次 GET（首次含 TLS 握手，不计入结论）")
+        try:
+            samples = probe.measure_latency(path=args.path, repeat=args.repeat, timeout=args.timeout)
+        except SessionError as exc:
+            print(f"[跳过] {exc}")
+            return 0
+        print(f"  各次耗时(ms)：{', '.join(str(s) for s in samples)}")
+        steady = samples[1:] or samples
+        if steady:
+            ordered = sorted(steady)
+            median = ordered[len(ordered) // 2]
+            print(f"  稳态（去掉首次）：最小 {min(steady)}ms / 中位 {median}ms / 最大 {max(steady)}ms  "
+                  f"（样本 {len(steady)}）")
+            print(f"  ⇒ 预发射提前量的量级参考：约 {median}ms（抢课参数别用首次那 {samples[0]}ms）")
+    return 0
+
+
 def _cmd_scrub(args: argparse.Namespace) -> int:
     source = Path(args.har)
     if not source.is_file():
@@ -198,6 +231,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_scrub.add_argument("har", help="要脱敏的 .har 文件路径")
     p_scrub.add_argument("--in-place", action="store_true",
                          help="就地覆盖（会先生成 .bak 备份）；默认输出 <名字>.scrubbed.har")
+
+    p_probe = sub.add_parser("probe", help="只读自检：脚本直连 API 是否可行（决定抢课引擎形态）")
+    p_probe.add_argument("--path", default="rest/time",
+                         help="要探测的接口路径（相对 API 基址，默认 rest/time；只发 GET）")
+    p_probe.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10）")
+    p_probe.add_argument("--repeat", type=int, default=5,
+                         help="额外做 N 次 keep-alive 连发以测稳态 RTT（默认 5；填 0 跳过）")
     return parser
 
 
@@ -210,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         "login": _cmd_login,
         "recon": _cmd_recon,
         "scrub": _cmd_scrub,
+        "probe": _cmd_probe,
         "stop": _cmd_stop,
         "logout": _cmd_logout,
     }

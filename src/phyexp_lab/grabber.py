@@ -21,10 +21,15 @@ from .models import BookingAttempt
 
 @dataclass
 class GrabConfig:
-    """提交策略参数。"""
+    """提交策略参数。**默认值按本系统实测校准，不是照抄别的项目**。"""
 
-    #: 提前多少毫秒发送请求（校园网经验值 100–300ms）
-    pre_fire_offset_ms: int = 200
+    #: 是否在提交前先发一次预热请求建立 TLS/keep-alive 连接。
+    #: ⚠️ 实测：不预热的话首次请求要付 ~1250ms（TLS 握手），抢课等于开局先落后 1.2 秒。
+    prewarm: bool = True
+
+    #: 提前多少毫秒发送请求。默认 50ms —— 依据：本系统稳态 RTT 中位 **11ms**（见 docs/接口逆向.md §3.6）。
+    #: ⚠️ 不要沿用教务系统那套 100–300ms：那是另一套系统的实测值，会提前过多。
+    pre_fire_offset_ms: int = 50
     #: 两次提交之间的最小间隔（毫秒）。**不要低于 800**：NUAA-Snatcher 实测会被限速
     min_submit_interval_ms: int = 800
     #: 单个目标的最大尝试次数
