@@ -37,9 +37,11 @@ playwright install chromium
 
 ```bash
 python run.py version              # 查看版本
-python run.py status               # 查看会话状态 / 数据目录
-python run.py login                # 打开浏览器，由你手动完成统一身份认证并保存会话
+python run.py status               # 查看会话状态 / token 有效期 / 数据目录
+python run.py login                # 打开浏览器，由你手动完成登录并保存会话
 python run.py recon                # 侦察：登录 + 把请求/响应（HAR + JSONL）录到本地，供接口逆向
+python run.py scrub <file.har>     # 脱敏 HAR：抹掉 Cookie/Authorization/密码 MD5 与敏感响应体后再分析
+python run.py logout               # 删除本地会话文件
 ```
 
 `recon` 会弹出真实 Chromium 窗口：**你在窗口里自行完成登录（含验证码），程序不接触你的密码**；登录后请在窗口里点进「预约选课」各页面，工具会把所有请求记录下来。
@@ -79,6 +81,9 @@ nuaa-phyexp-lab/
 ## 隐私与合规
 
 - 账号密码、会话 Cookie、HAR **绝不进入仓库**（见 `.gitignore` 与上面的数据目录约定）；采集日志对敏感头做了脱敏。
+- **HAR 是敏感文件**：它包含 `Authorization: Bearer <jwt>`、Cookie、以及登录请求体里的**密码 MD5**（可离线爆破）。
+  因此本仓库提供 `python run.py scrub`：默认输出 `*.scrubbed.har`（`--in-place` 会先备份 `.bak`），
+  抹掉敏感头值、敏感接口的请求体/响应体，并**复检**是否还有残留（有残留则退出码 1）。
 - 请求一律**低频 + 限速退避**，不做高频轰炸；工具仅个人学习使用，请遵守学校相关管理规定。
 - 本项目不做验证码破解：验证码由使用者本人在浏览器里输入。
 

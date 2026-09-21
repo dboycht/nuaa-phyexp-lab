@@ -16,7 +16,7 @@ import datetime as dt
 import sys
 from pathlib import Path
 
-from . import __version__, config, session
+from . import __version__, config, scrub, session
 from .session import PlaywrightMissingError, SessionError
 
 REPO_URL = "https://github.com/dboycht/nuaa-phyexp-lab"
@@ -120,6 +120,33 @@ def _cmd_recon(args: argparse.Namespace) -> int:
                       use_saved_state=not args.no_saved_state)
 
 
+def _cmd_scrub(args: argparse.Namespace) -> int:
+    source = Path(args.har)
+    if not source.is_file():
+        print(f"[错误] HAR 文件不存在：{source}", file=sys.stderr)
+        return 2
+
+    target = source if args.in_place else scrub.default_target(source)
+    if args.in_place:
+        backup = source.with_name(source.name + ".bak")
+        backup.write_bytes(source.read_bytes())
+        print(f"[info] 原文件已备份 → {backup}")
+
+    stats = scrub.scrub_har(source, target)
+    print(f"[完成] 脱敏输出 → {target}")
+    print(f"  条目 {stats['entries']} 条：删除 postData {stats['post_data_removed']} 处、"
+          f"脱敏敏感头 {stats['headers_redacted']} 处、删除敏感响应体 {stats['bodies_removed']} 条")
+
+    problems = scrub.verify_no_credentials(target)
+    if problems:
+        print("[警告] 复检发现残留，请人工检查：")
+        for item in problems[:20]:
+            print(f"  - {item}")
+        return 1
+    print("[复检] 未发现明文凭据 / 敏感接口残留 postData / 残留 JWT ✅")
+    return 0
+
+
 def _cmd_logout(_args: argparse.Namespace) -> int:
     removed = session.clear_state()
     if removed:
@@ -156,6 +183,11 @@ def build_parser() -> argparse.ArgumentParser:
                          help="最长等待秒数（默认 1800，即 30 分钟）")
     p_recon.add_argument("--no-saved-state", action="store_true",
                          help="不载入上次会话，强制重新登录")
+
+    p_scrub = sub.add_parser("scrub", help="HAR 脱敏：抹掉凭据与敏感响应体后再做分析")
+    p_scrub.add_argument("har", help="要脱敏的 .har 文件路径")
+    p_scrub.add_argument("--in-place", action="store_true",
+                         help="就地覆盖（会先生成 .bak 备份）；默认输出 <名字>.scrubbed.har")
     return parser
 
 
@@ -167,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": _cmd_status,
         "login": _cmd_login,
         "recon": _cmd_recon,
+        "scrub": _cmd_scrub,
         "logout": _cmd_logout,
     }
     return handlers[args.command](args)
