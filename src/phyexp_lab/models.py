@@ -61,6 +61,8 @@ class Outcome(str, Enum):
     RATE_LIMITED = "rate_limited"
     AUTH_EXPIRED = "auth_expired"
     UNKNOWN = "unknown"
+    #: 演练（dry-run）——**绝不等同于成功**，单独一类，避免把彩排结果当成战果
+    DRY_RUN = "dry_run"
 
 
 @dataclass
@@ -75,3 +77,7 @@ class BookingAttempt:
     outcome: Outcome = Outcome.UNKNOWN
     http_status: int | None = None
     elapsed_ms: int | None = None
+    #: 实际发射时刻（本地时间戳）
+    attempted_at: float | None = None
+    #: 与计划发射时刻的偏差（毫秒，正 = 晚于计划）——**调预发射偏移的唯一依据**
+    deviation_ms: float | None = None

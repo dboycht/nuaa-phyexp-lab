@@ -44,6 +44,8 @@ python run.py probe                # 只读自检：脚本直连 API 是否可�
 python run.py snapshot             # 只读采集：课程 → 实验项目 → 场次（含容量/已选/余量）落盘
 python run.py watch                # 余量监控：低频轮询关注场次（只读，样本逐轮落盘）
 python run.py gui                  # 图形界面：只读工作台（PySide6）
+python run.py clock                # 时钟对时：测出「服务端 − 本地」偏移（抢课打点依据）
+python run.py grab --slot <id> --in 20   # 抢课引擎演练（dry-run：只做定时，不发写请求）
 python run.py scrub <file.har>     # 脱敏 HAR：抹掉 Cookie/Authorization/密码 MD5 与敏感响应体后再分析
 python run.py stop                 # 让正在运行的 login/recon 优雅收尾（HAR 才会落盘！）
 python run.py logout               # 删除本地会话文件

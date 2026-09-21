@@ -120,6 +120,92 @@ def _cmd_recon(args: argparse.Namespace) -> int:
                       use_saved_state=not args.no_saved_state)
 
 
+def _cmd_clock(args: argparse.Namespace) -> int:
+    """时钟对时：测出「服务端 − 本地」偏移（抢课打点必须按服务端时刻）。"""
+    from . import probe
+
+    try:
+        offset = probe.measure_clock_offset(samples=args.samples, timeout=args.timeout)
+    except SessionError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+
+    print(offset.summary)
+    print(f"测量时刻        : {offset.measured_at}")
+    now_local = dt.datetime.now().astimezone()
+    est_server = now_local + dt.timedelta(seconds=offset.offset_seconds)
+    print(f"本地当前        : {now_local.isoformat(timespec='milliseconds')}")
+    print(f"推算服务端      : {est_server.isoformat(timespec='milliseconds')}")
+    print("[用途] 抢课的目标时刻一律换算成服务端时刻再打点；本地钟差 1 秒就足以错过整场。")
+    return 0
+
+
+def _cmd_grab(args: argparse.Namespace) -> int:
+    """抢课引擎（当前只有演练）：对时 → 预热 → 定时 → 预发射 → 限速退避。"""
+    from . import api, grabber
+
+    slot_ids = [s.strip() for s in str(args.slot).split(",") if s.strip()]
+    if not slot_ids:
+        print("[错误] 请用 --slot 指定目标场次 id（可逗号分隔多个）。", file=sys.stderr)
+        return 2
+
+    now_local = dt.datetime.now().astimezone()
+    if args.in_seconds is not None:
+        target_local_guess = now_local + dt.timedelta(seconds=args.in_seconds)
+        target_wall = target_local_guess.strftime("%H:%M:%S")
+        print(f"[演练] 目标：从现在起 {args.in_seconds} 秒后发射（约本地 {target_wall}）")
+    elif args.at:
+        try:
+            hour, minute, second = (int(x) for x in args.at.split(":"))
+            target_wall_dt = now_local.replace(hour=hour, minute=minute, second=second, microsecond=0)
+        except Exception:
+            print("[错误] --at 格式应为 HH:MM:SS（例如 21:30:00）。", file=sys.stderr)
+            return 2
+        target_local_guess = target_wall_dt
+        print(f"[演练] 目标：服务端时钟走到 {args.at} 时发射")
+    else:
+        print("[错误] 需要 --at HH:MM:SS 或 --in 秒数。", file=sys.stderr)
+        return 2
+
+    try:
+        client = api.PhyExpClient(timeout=args.timeout)
+    except api.ApiError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+
+    cfg = grabber.GrabConfig(
+        pre_fire_offset_ms=args.pre_fire,
+        min_submit_interval_ms=args.interval,
+        max_attempts_per_target=args.max_attempts,
+    )
+    engine = grabber.Grabber(client, cfg)
+    try:
+        engine.prepare(measure_clock=not args.no_clock)
+        if args.no_clock:
+            print("[准备] 已跳过对时（--no-clock）——此时按本地钟打点，仅供参考。")
+        # 把"想打的墙上时刻"换算成服务端 epoch：
+        # 我们认为该 HH:MM:SS 就是服务端时钟读数，故 target_server_epoch = 该墙上时刻的 epoch
+        target_server_epoch = target_local_guess.timestamp()
+        engine.run_until(slot_ids, target_server_epoch, dry_run=not args.real)
+    except NotImplementedError as exc:
+        print(f"[拒绝执行] {exc}", file=sys.stderr)
+        return 2
+    except grabber.GrabError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+    finally:
+        client.close()
+
+    print()
+    print("[演练汇总]（dry-run 的结果**不是**成功，只说明定时链路走通了）")
+    for attempt in engine.attempts:
+        deviation = "-" if attempt.deviation_ms is None else f"{attempt.deviation_ms:+.1f}ms"
+        print(f"  场次 {attempt.slot_id}  结果 {attempt.outcome.value}  计划偏差 {deviation}")
+    if args.real:
+        print("[提示] 真实提交尚未实现：写接口需在选课窗口开放时实测后再接入。")
+    return 0
+
+
 def _cmd_gui(_args: argparse.Namespace) -> int:
     """启动 PySide6 只读工作台。"""
     try:
@@ -387,6 +473,23 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("stop", help="让正在运行的 login/recon 优雅收尾（保存 HAR 后退出）")
     sub.add_parser("gui", help="启动图形界面（PySide6 只读工作台）")
 
+    p_clock = sub.add_parser("clock", help="时钟对时：测出「服务端 − 本地」偏移")
+    p_clock.add_argument("--samples", type=int, default=7, help="对时采样次数（默认 7）")
+    p_clock.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10）")
+
+    p_grab = sub.add_parser("grab", help="抢课引擎：对时 + 预热 + 精确定时 + 预发射（当前默认演练）")
+    p_grab.add_argument("--slot", required=True, help="目标场次 id（可逗号分隔多个）")
+    p_grab.add_argument("--at", default=None, help="服务端墙上时刻 HH:MM:SS（今天）")
+    p_grab.add_argument("--in", dest="in_seconds", type=float, default=None,
+                        help="从现在起多少秒后发射（演练方便；与 --at 二选一）")
+    p_grab.add_argument("--real", action="store_true",
+                        help="真实提交（**目前会明确报错**：写接口未实测，禁止猜测参数）")
+    p_grab.add_argument("--pre-fire", type=int, default=50, help="预发射提前毫秒数（默认 50）")
+    p_grab.add_argument("--interval", type=int, default=800, help="两次提交最小间隔毫秒（默认 800）")
+    p_grab.add_argument("--max-attempts", type=int, default=5, help="最大尝试次数（默认 5）")
+    p_grab.add_argument("--no-clock", action="store_true", help="跳过对时（不推荐）")
+    p_grab.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10）")
+
     p_login = sub.add_parser("login", help="打开浏览器登录并保存会话")
     p_login.add_argument("--max-wait", type=int, default=1800,
                          help="最长等待秒数（默认 1800，即 30 分钟）")
@@ -441,6 +544,8 @@ def main(argv: list[str] | None = None) -> int:
         "snapshot": _cmd_snapshot,
         "watch": _cmd_watch,
         "gui": _cmd_gui,
+        "clock": _cmd_clock,
+        "grab": _cmd_grab,
         "stop": _cmd_stop,
         "logout": _cmd_logout,
     }

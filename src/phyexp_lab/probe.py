@@ -140,3 +140,80 @@ def measure_latency(path: str = "rest/time", repeat: int = 5, timeout: float = 1
             if not (200 <= resp.status_code < 300):
                 break
     return elapsed
+
+
+@dataclass
+class ClockOffset:
+    """本地钟相对服务端的偏移测量结果（N 次往返取中位数）。"""
+
+    #: 服务端时刻 - 本地时刻，单位秒。**正值 = 本地慢（需要往前补）**
+    offset_seconds: float
+    rtt_ms_min: int
+    rtt_ms_median: int
+    samples: int
+    spread_seconds: float
+    measured_at: str
+
+    @property
+    def summary(self) -> str:
+        direction = "本地慢" if self.offset_seconds >= 0 else "本地快"
+        return (f"服务端 − 本地 = {self.offset_seconds:+.3f}s（{direction} {abs(self.offset_seconds):.3f}s）；"
+                f"RTT 最小 {self.rtt_ms_min}ms / 中位 {self.rtt_ms_median}ms；"
+                f"{self.samples} 次采样，离散度 {self.spread_seconds * 1000:.0f}ms")
+
+
+def measure_clock_offset(samples: int = 7, timeout: float = 10.0) -> ClockOffset:
+    """用 `rest/time` 做 N 次往返，估算「服务端 − 本地」的时钟偏移。
+
+    原理：第 i 次往返里，服务端时间戳对应本地时刻约 `t0 + rtt/2`，
+    故 `offset_i = server_time_i - (t0_i + rtt_i/2)`；取**中位数**抗抖动。
+    """
+    import datetime as dt
+    import statistics
+    import time
+
+    import requests
+
+    token = session.load_token()
+    if not token:
+        raise session.SessionError("缺少已保存的 token：请先运行 `python run.py login`。")
+
+    url = f"{config.API_BASE}/rest/time"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": config.USER_AGENT,
+        "Authorization": token,
+        "Referer": config.BOOKING_ENTRY,
+    }
+    offsets: list[float] = []
+    rtts: list[int] = []
+    with requests.Session() as http:
+        http.headers.update(headers)
+        # 先预热：第一次请求含 TLS 握手，其 RTT 不代表稳态
+        http.get(url, timeout=timeout)
+        for _ in range(max(1, samples)):
+            t0 = time.time()
+            resp = http.get(url, timeout=timeout)
+            t1 = time.time()
+            if resp.status_code != 200:
+                continue
+            payload = resp.json()
+            stamp = payload[0].get("time") if isinstance(payload, list) and payload else None
+            if not stamp:
+                continue
+            server_epoch = dt.datetime.fromisoformat(stamp).timestamp()
+            rtt = t1 - t0
+            rtts.append(int(rtt * 1000))
+            offsets.append(server_epoch - (t0 + rtt / 2.0))
+
+    if not offsets:
+        raise session.SessionError("对时失败：没有拿到可用的服务端时间戳。")
+
+    return ClockOffset(
+        offset_seconds=statistics.median(offsets),
+        rtt_ms_min=min(rtts),
+        rtt_ms_median=int(statistics.median(rtts)),
+        samples=len(offsets),
+        spread_seconds=(max(offsets) - min(offsets)),
+        measured_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+    )
