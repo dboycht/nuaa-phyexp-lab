@@ -22,8 +22,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from .api import PhyExpClient
@@ -31,6 +33,9 @@ from .models import BookingAttempt, Outcome
 from .probe import ClockOffset, measure_clock_offset
 
 LogFn = Callable[[str], None]
+#: 真实提交函数的签名：吃一个场次 id，返回一次尝试记录。
+#: **写接口实测完成后，只需要实现这样一个函数并注入**，引擎本身不用改。
+SubmitFn = Callable[[str], BookingAttempt]
 
 
 def _log(msg: str) -> None:
@@ -93,12 +98,15 @@ class Grabber:
     """按服务端时刻精确定时，对一组场次执行"预发射 + 间隔重试"的提交。"""
 
     def __init__(self, client: PhyExpClient, config: GrabConfig | None = None,
-                 log: LogFn = _log) -> None:
+                 log: LogFn = _log, submit_func: SubmitFn | None = None) -> None:
         self.client = client
         self.config = config or GrabConfig()
         self.log = log
+        #: 真实提交流程的注入点（写接口实测后从这里接进去，引擎无需改动）
+        self.submit_func = submit_func
         self.clock: ClockOffset | None = None
         self.attempts: list[BookingAttempt] = []
+        self.log_path: Path | None = None
 
     # ── 准备：对时 + 预热 ──
 
@@ -140,7 +148,7 @@ class Grabber:
         """向单个时段提交一次预约，并把结果分类。
 
         `dry_run=True` 时**不发任何写请求**，只记录一次演练（`Outcome.DRY_RUN`）；
-        `dry_run=False` 目前会抛 `NotImplementedError`（写接口未实测，不猜参数）。
+        `dry_run=False` 时需要外部注入 `submit_func`（写接口实测后实现），否则抛 `NotImplementedError`。
         """
         started = time.time()
         if dry_run:
@@ -148,34 +156,72 @@ class Grabber:
             return BookingAttempt(slot_id=slot_id, started_at=started,
                                   message="dry-run：未发送请求", outcome=Outcome.DRY_RUN)
 
-        raise NotImplementedError(
-            "真实提交尚未实现：需在**选课窗口开放时**抓一次真实提交"
-            "（POST report-api/electives）确认请求体与响应判据后再实现。"
-            "见 docs/接口逆向.md §3.4/§六。"
-        )
+        if self.submit_func is None:
+            raise NotImplementedError(
+                "真实提交尚未接入：需在**选课窗口开放时**抓一次真实提交"
+                "（POST report-api/electives）确认请求体与响应判据，"
+                "然后实现 `api.PhyExpClient.submit_booking` 并通过 Grabber(submit_func=...) 注入。"
+                "见 docs/接口逆向.md §3.4 与 docs/选课窗口操作手册.md。"
+            )
+        return self.submit_func(slot_id)
+
+    # ── 发射日志（当天事后复盘的唯一依据）──
+
+    def _open_log(self) -> None:
+        from . import config
+
+        logs = config.logs_dir()
+        logs.mkdir(parents=True, exist_ok=True)
+        self.log_path = logs / f"grab-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.jsonl"
+
+    def _record(self, attempt: BookingAttempt) -> None:
+        if self.log_path is None:
+            return
+        payload = {
+            "slot_id": attempt.slot_id,
+            "outcome": attempt.outcome.value,
+            "message": attempt.message[:500],
+            "http_status": attempt.http_status,
+            "elapsed_ms": attempt.elapsed_ms,
+            "deviation_ms": attempt.deviation_ms,
+            "started_at": dt.datetime.fromtimestamp(attempt.started_at).astimezone().isoformat(timespec="milliseconds"),
+        }
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            handle.flush()
 
     # ── 主流程 ──
 
     def run_until(self, slot_ids: list[str], target_server_epoch: float, *,
                   dry_run: bool = True,
-                  max_attempts: int | None = None) -> list[BookingAttempt]:
+                  max_attempts: int | None = None,
+                  plan_only: bool = False) -> list[BookingAttempt]:
         """等到目标时刻（服务端时钟）后按策略提交，返回全部尝试记录。
 
         ⚠️ **默认 dry_run=True**：这是刻意的 —— 写接口没实测之前，
         真实提交只能是显式的 `dry_run=False`（并且会立刻报错），不能"不小心就发出去了"。
+        `plan_only=True` 只打印计划就返回（窗口当天先核对计划用）。
         """
         if not slot_ids:
             raise GrabError("没有指定目标场次。")
-        if not dry_run:
-            self.submit_once(slot_ids[0], dry_run=False)  # 立刻抛出明确的未实现错误
+        if not dry_run and self.submit_func is None:
+            self.submit_once(slot_ids[0], dry_run=False)  # 立刻抛出明确的未接入错误
 
         plan = self.plan(slot_ids, target_server_epoch)
         self.log("[计划]")
         for line in plan.render().splitlines():
             self.log(f"    {line}")
 
+        if plan_only:
+            self.log("[plan-only] 只打印计划，未做任何等待或提交。")
+            return []
+
         if plan.lead_seconds <= 0:
             self.log("[警告] 目标时刻已过或不足以准备，仍按当前时刻立即执行（演练）。")
+
+        self._open_log()
+        if self.log_path:
+            self.log(f"[日志] 每次发射都会写入 → {self.log_path}")
 
         # 粗等到发射时刻前 0.2 秒，再用短睡精调（避免长 sleep 的系统调度误差）
         while True:
@@ -200,6 +246,7 @@ class Grabber:
                 attempt.attempted_at = fired_at
                 attempt.deviation_ms = deviation_ms
                 self.attempts.append(attempt)
+                self._record(attempt)
 
                 if attempt.outcome in (Outcome.SUCCESS, Outcome.FULL, Outcome.REJECTED):
                     self.log(f"[结束] 场次 {slot_id} 结果为 {attempt.outcome.value}，停止重试。")

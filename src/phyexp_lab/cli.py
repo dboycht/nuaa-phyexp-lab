@@ -230,7 +230,8 @@ def _cmd_grab(args: argparse.Namespace) -> int:
         # 把"想打的墙上时刻"换算成服务端 epoch：
         # 我们认为该 HH:MM:SS 就是服务端时钟读数，故 target_server_epoch = 该墙上时刻的 epoch
         target_server_epoch = target_local_guess.timestamp()
-        engine.run_until(slot_ids, target_server_epoch, dry_run=not args.real)
+        engine.run_until(slot_ids, target_server_epoch, dry_run=not args.real,
+                         plan_only=args.plan_only)
     except NotImplementedError as exc:
         print(f"[拒绝执行] {exc}", file=sys.stderr)
         return 2
@@ -536,6 +537,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_grab.add_argument("--interval", type=int, default=800, help="两次提交最小间隔毫秒（默认 800）")
     p_grab.add_argument("--max-attempts", type=int, default=5, help="最大尝试次数（默认 5）")
     p_grab.add_argument("--no-clock", action="store_true", help="跳过对时（不推荐）")
+    p_grab.add_argument("--plan-only", action="store_true",
+                        help="只打印发射计划就退出（窗口当天先核对计划用）")
     p_grab.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10）")
 
     p_login = sub.add_parser("login", help="打开浏览器登录并保存会话")
