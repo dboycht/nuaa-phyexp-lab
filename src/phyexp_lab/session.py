@@ -250,6 +250,7 @@ def interactive_login(
     last_token = ""
     last_heartbeat = 0.0
     announced = False
+    no_page_since: float | None = None
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=False, args=config.CHROMIUM_ARGS)
@@ -292,6 +293,7 @@ def interactive_login(
         log("")
         log("  说明：程序不接触你的密码；只要检测到登录态就自动保存会话。")
         log("  完成后直接关闭浏览器窗口即可（或到此终端按 Ctrl+C）。")
+        log(f"  想让它主动收尾（更稳妥，HAR 一定会落盘）：另开终端跑 `python run.py stop`。")
         log("=" * 70)
         log("")
 
@@ -300,6 +302,30 @@ def interactive_login(
                 if not browser.is_connected():
                     log("[info] 浏览器窗口已关闭，准备收尾。")
                     break
+
+                # 优雅停止开关：外部删掉/创建 STOP.flag 即可收尾（不必杀进程，HAR 才能落盘）
+                if config.stop_flag_path().is_file():
+                    log(f"[info] 检测到停止标志 {config.stop_flag_path()}，准备收尾。")
+                    try:
+                        config.stop_flag_path().unlink()
+                    except OSError:
+                        pass
+                    break
+
+                # 标签页全被关掉（但 Chromium 进程仍在）时不能傻等：连续 15 秒无标签页即收尾
+                try:
+                    page_count = len(context.pages)
+                except Exception:
+                    page_count = 0
+                if page_count == 0:
+                    if no_page_since is None:
+                        no_page_since = time.time()
+                        log("[info] 所有标签页已关闭；若 15 秒内没有新标签页就收尾。")
+                    elif time.time() - no_page_since >= 15:
+                        log("[info] 已确认无标签页，准备收尾。")
+                        break
+                else:
+                    no_page_since = None
 
                 token = _read_token(context)
                 if token and token != last_token:

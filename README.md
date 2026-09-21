@@ -41,6 +41,7 @@ python run.py status               # 查看会话状态 / token 有效期 / 数�
 python run.py login                # 打开浏览器，由你手动完成登录并保存会话
 python run.py recon                # 侦察：登录 + 把请求/响应（HAR + JSONL）录到本地，供接口逆向
 python run.py scrub <file.har>     # 脱敏 HAR：抹掉 Cookie/Authorization/密码 MD5 与敏感响应体后再分析
+python run.py stop                 # 让正在运行的 login/recon 优雅收尾（HAR 才会落盘！）
 python run.py logout               # 删除本地会话文件
 ```
 
@@ -75,6 +76,7 @@ nuaa-phyexp-lab/
 │  └─ cli.py                     # 命令行入口
 └─ docs/
    ├─ 接口逆向.md                 # 已实测事实 + 待填接口清单
+   ├─ 答题链路.md                  # 实验前「预习测试」链路研究（含实验当天抓取流程）
    └─ 排课与放课规律.md            # 数据研究问题与方法
 ```
 

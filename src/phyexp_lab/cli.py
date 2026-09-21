@@ -147,6 +147,15 @@ def _cmd_scrub(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_stop(_args: argparse.Namespace) -> int:
+    config.ensure_home()
+    flag = config.stop_flag_path()
+    flag.write_text("stop\n", encoding="utf-8")
+    print(f"[完成] 已请求优雅收尾：{flag}")
+    print("       正在运行的 login/recon 会在下一次轮询（≤1 秒）时保存会话与 HAR 后退出。")
+    return 0
+
+
 def _cmd_logout(_args: argparse.Namespace) -> int:
     removed = session.clear_state()
     if removed:
@@ -171,6 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("version", help="查看版本与目标系统")
     sub.add_parser("status", help="查看数据目录 / 会话 / 采集文件状态")
     sub.add_parser("logout", help="删除本地会话文件")
+    sub.add_parser("stop", help="让正在运行的 login/recon 优雅收尾（保存 HAR 后退出）")
 
     p_login = sub.add_parser("login", help="打开浏览器登录并保存会话")
     p_login.add_argument("--max-wait", type=int, default=1800,
@@ -200,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         "login": _cmd_login,
         "recon": _cmd_recon,
         "scrub": _cmd_scrub,
+        "stop": _cmd_stop,
         "logout": _cmd_logout,
     }
     return handlers[args.command](args)

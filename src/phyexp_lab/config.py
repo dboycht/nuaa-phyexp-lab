@@ -118,5 +118,10 @@ def recon_dir() -> Path:
     return home_dir() / "recon"
 
 
+def stop_flag_path() -> Path:
+    """删除这个文件即请求登录/侦察流程优雅收尾（不杀进程，保证 HAR 落盘）。"""
+    return home_dir() / "STOP.flag"
+
+
 def logs_dir() -> Path:
     return home_dir() / "logs"
