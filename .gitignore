@@ -1,0 +1,35 @@
+# ── 运行时数据与凭据：绝不入库 ──
+data/
+*.har
+*.jsonl
+session*.json
+cookies*.json
+storage_state*.json
+.env
+
+# ── 开发文档：只留开发副本，不同步 GitHub ──
+DEVELOPMENT.md
+ERROR.md
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 临时/编辑器 ──
+_scratch/
+*.log
+*.tmp
+.vscode/
+.idea/
+.DS_Store

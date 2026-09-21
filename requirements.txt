@@ -1,0 +1,9 @@
+# 运行依赖 / Runtime requirements
+# 登录与请求采集（必需）
+playwright>=1.40
+
+# 数据研究阶段的接口调用（cookie 复用）
+requests>=2.31
+
+# 图形界面（阶段 2 起使用；安装失败不影响 CLI 研究流程）
+PySide6>=6.6
