@@ -148,6 +148,17 @@ class SlotMonitor:
                 slots = self.poll_once(course_id, project_ids)
                 self.rounds += 1
 
+                if not slots:
+                    # 纪律：失败轮次**绝不写入样本**（否则"全部查询失败"会被当成"余量全是 0"）。
+                    # 这类轮次只记日志，并让退避接手。
+                    self.failures += 1
+                    self.log(f"[{self.rounds:>4}] 本轮没有任何可用数据（项目全部查询失败），"
+                             f"**不写入样本**；失败累计 {self.failures}")
+                    interval = min(max(interval, self.config.backoff_base_seconds) * self.config.backoff_factor,
+                                   self.config.backoff_max_seconds)
+                    time.sleep(interval)
+                    continue
+
                 changes = 0
                 for slot_id, slot in slots.items():
                     old = previous.get(slot_id)
