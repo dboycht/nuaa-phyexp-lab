@@ -120,6 +120,166 @@ def _cmd_recon(args: argparse.Namespace) -> int:
                       use_saved_state=not args.no_saved_state)
 
 
+def _cmd_snapshot(args: argparse.Namespace) -> int:
+    """只读采集：课程 → 实验项目 → 场次（含容量/已选人数/余量），落盘为快照 JSON。"""
+    import json
+
+    from . import api
+
+    config.ensure_home()
+    snap_dir = config.home_dir() / "snapshots"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        client = api.PhyExpClient(timeout=args.timeout)
+    except api.ApiError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        warm_ms = client.prewarm()
+        server_time = client.server_time()
+        local_time = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        print(f"预热耗时        : {warm_ms} ms")
+        print(f"服务端时间      : {server_time}")
+        print(f"本地时间        : {local_time}")
+
+        semesters = client.open_semesters()
+        if not semesters:
+            print("[警告] 当前没有开放学期，无法采集。")
+            return 0
+        semester = semesters[0]
+        print(f"开放学期        : id={semester.get('id')} {semester.get('name')} "
+              f"({semester.get('since')} ~ {semester.get('to')})")
+
+        courses = client.my_courses(semester.get("id"))
+        print(f"我的课程        : {len(courses)} 门")
+
+        snapshot: dict = {
+            "captured_at": local_time,
+            "server_time": server_time,
+            "prewarm_ms": warm_ms,
+            "semester": {k: semester.get(k) for k in ("id", "code", "name", "since", "to")},
+            "courses": [],
+        }
+
+        total_projects = total_slots = total_free = 0
+        for course in courses:
+            course_id = course.get("id")
+            entry = {
+                "course_id": course_id,
+                "name": course.get("name"),
+                "code": course.get("code"),
+                "projects": [],
+            }
+            projects = client.course_projects(course_id)
+            free_of_course = 0
+            for row in projects:
+                experiment = client.to_experiment(row)
+                rows = client.slots(course_id, project_id=experiment.experiment_id,
+                                    with_my_status=not args.all_status)
+                slots = [client.to_slot(r) for r in rows]
+                free = [s for s in slots if (s.remaining or 0) > 0]
+                free_of_course += len(free)
+                total_projects += 1
+                total_slots += len(slots)
+                total_free += len(free)
+                entry["projects"].append({
+                    "project_id": experiment.experiment_id,
+                    "name": experiment.name,
+                    "slot_count": len(slots),
+                    "free_slot_count": len(free),
+                    "slots": [
+                        {
+                            "slot_id": s.slot_id,
+                            "time": s.time_text,
+                            "location": s.location,
+                            "taken": s.taken,
+                            "capacity": s.capacity,
+                            "remaining": s.remaining,
+                        }
+                        for s in slots
+                    ],
+                })
+                print(f"  [{course_id}] {experiment.experiment_id:>4} {experiment.name[:24]:24s} "
+                      f"场次 {len(slots):3d}，有余额 {len(free):3d}")
+            entry["free_slot_count"] = free_of_course
+            snapshot["courses"].append(entry)
+        snapshot["totals"] = {
+            "projects": total_projects,
+            "slots": total_slots,
+            "free_slots": total_free,
+        }
+    finally:
+        client.close()
+
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = snap_dir / f"snapshot-{stamp}.json"
+    out.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("-" * 74)
+    print(f"合计：实验项目 {total_projects} 个，场次 {total_slots} 条，其中有余额 {total_free} 条")
+    print(f"快照已保存 → {out}")
+    if total_slots == 0:
+        print("[说明] 场次为 0 是**如实结果**：可能该学期尚未放课/已结束，或该项目的排课未发布。")
+    return 0
+
+
+def _cmd_watch(args: argparse.Namespace) -> int:
+    """余量监控：低频轮询关注场次的剩余名额，变化即时打印并逐轮落盘。"""
+    from . import api, monitor
+
+    try:
+        client = api.PhyExpClient(timeout=args.timeout)
+    except api.ApiError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        semesters = client.open_semesters()
+        if not semesters:
+            print("[警告] 当前没有开放学期。")
+            return 0
+        courses = client.my_courses(semesters[0].get("id"))
+        if not courses:
+            print("[警告] 该学期没有我的课程。")
+            return 0
+        course_id = args.course or courses[0].get("id")
+
+        if args.projects:
+            project_ids = [p.strip() for p in args.projects.split(",") if p.strip()]
+        else:
+            project_ids = [client.to_experiment(r).experiment_id
+                           for r in client.course_projects(course_id)]
+        print(f"课程 id={course_id}，监控 {len(project_ids)} 个实验项目；"
+              f"间隔 {args.interval}s，轮数 {'不限' if args.rounds <= 0 else args.rounds}")
+
+        cfg = monitor.MonitorConfig(min_interval_seconds=args.interval)
+        writer = None if args.no_save else monitor.SampleWriter.default()
+        if writer:
+            print(f"样本文件 → {writer.path}")
+        mon = monitor.SlotMonitor(client, cfg, writer=writer)
+
+        def on_change(slot, prev) -> None:  # type: ignore[no-untyped-def]
+            old = "（首次见到）" if prev is None else str(prev.remaining)
+            print(f"  [变化] 场次 {slot.slot_id} {slot.time_text} "
+                  f"余量 {old} → {slot.remaining}（{slot.taken}/{slot.capacity}）"
+                  f"{' @ ' + slot.location if slot.location else ''}")
+
+        mon.run(course_id, project_ids,
+                max_rounds=(None if args.rounds <= 0 else args.rounds),
+                on_change=on_change)
+    except api.ApiError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+    finally:
+        client.close()
+
+    if not args.no_save:
+        print("[提示] 样本已逐轮落盘；研究阶段建议用 60–300s 间隔，别高频打扰系统。")
+    return 0
+
+
 def _cmd_probe(args: argparse.Namespace) -> int:
     """只读连通性自检：脚本直连 API 到底行不行（决定抢课引擎形态）。"""
     print(f"目标：GET {config.API_BASE}/{args.path.lstrip('/')}   （只读，无写操作）")
@@ -238,6 +398,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_probe.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10）")
     p_probe.add_argument("--repeat", type=int, default=5,
                          help="额外做 N 次 keep-alive 连发以测稳态 RTT（默认 5；填 0 跳过）")
+
+    p_snapshot = sub.add_parser("snapshot", help="只读采集课程/实验项目/场次余量并落盘")
+    p_snapshot.add_argument("--timeout", type=float, default=20.0, help="单次请求超时秒数（默认 20）")
+    p_snapshot.add_argument("--all-status", action="store_true",
+                            help="取该项目**全部已发布**场次（研究余量用）；不加则只取「我已选/已排」的场次（与前端首页一致）")
+
+    p_watch = sub.add_parser("watch", help="余量监控：低频轮询关注场次的剩余名额（只读）")
+    p_watch.add_argument("--course", default=None, help="课程 id（默认取我该学期第一门课）")
+    p_watch.add_argument("--projects", default=None,
+                         help="逗号分隔的实验项目 id（默认监控该课程全部项目）")
+    p_watch.add_argument("--interval", type=float, default=60.0,
+                         help="轮询间隔秒数（默认 60；研究期建议 60–300，追放闸时可临时 3–10）")
+    p_watch.add_argument("--rounds", type=int, default=0, help="轮数（默认 0 = 一直跑；研究/测试可设小值）")
+    p_watch.add_argument("--timeout", type=float, default=20.0, help="单次请求超时秒数（默认 20）")
+    p_watch.add_argument("--no-save", action="store_true", help="不落盘样本（仅打印）")
     return parser
 
 
@@ -251,6 +426,8 @@ def main(argv: list[str] | None = None) -> int:
         "recon": _cmd_recon,
         "scrub": _cmd_scrub,
         "probe": _cmd_probe,
+        "snapshot": _cmd_snapshot,
+        "watch": _cmd_watch,
         "stop": _cmd_stop,
         "logout": _cmd_logout,
     }

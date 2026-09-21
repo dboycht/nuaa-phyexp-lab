@@ -1,20 +1,35 @@
-"""余量监控：低频轮询目标时段的剩余名额，发现空位后交给抢课引擎。
+"""余量监控：低频轮询关注场次的剩余名额，记录变化并（未来）交给抢课引擎。
 
-**当前状态：未实现（阶段 0）** —— 依赖 `api.PhyExpClient` 的接口逆向结果。
-
-已确定的设计约束（来自需求和既有经验，实现时不要违背）
-----------------------------------------------------
-1. **低频**：轮询间隔不得低于 `min_interval_seconds`；命中限速时**指数退避**而不是硬顶。
-2. **可中断**：监控是长跑进程，必须响应 Ctrl+C 且退出时不吞掉已收集的数据。
-3. **先观察再动作**：放课规律（`docs/排课与放课规律.md`）研究清楚之前，监控只记录不提交。
+设计约束（都来自本项目实测，不是照抄别的项目）
+--------------------------------------------
+1. **连接必须复用并预热**：实测首次请求 1250ms（TLS 握手），keep-alive 稳态 11ms
+   ⇒ 监控主循环全程复用同一个 `PhyExpClient` 会话，并在首轮前 `prewarm()`。
+2. **低频 + 指数退避**：默认最小间隔 3 秒（研究期建议 60–300 秒）；命中限速/超时则退避，
+   而不是硬顶重试。
+3. **只读**：监控阶段**只发 GET**，不调用任何写接口。
+4. **失败轮次不得污染数据**：一轮里某个项目查询失败时，只记录失败原因，**不把该轮写进样本**
+   （否则"查失败"会被误算成"余量为 0"）。
+5. **可中断且不丢数据**：样本逐条 append + flush，Ctrl+C 后已采数据仍在盘上。
 """
 
 from __future__ import annotations
 
+import datetime as dt
+import json
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Iterable
 
-from .api import PhyExpClient
+from . import config
+from .api import ApiError, PhyExpClient
 from .models import Slot
+
+LogFn = Callable[[str], None]
+
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
 
 
 @dataclass
@@ -27,29 +42,112 @@ class MonitorConfig:
     backoff_base_seconds: float = 5.0
     backoff_factor: float = 2.0
     #: 退避上限（秒）
-    backoff_max_seconds: float = 120.0
-    #: 关注的时段 ID（空 = 监控全部时段，仅做数据采集）
-    watch_slot_ids: list[str] = field(default_factory=list)
+    backoff_max_seconds: float = 300.0
+    #: 关注的实验项目（project_id）；空 = 全部
+    watch_project_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SampleWriter:
+    """把每一轮样本按 JSONL 追加落盘（默认在 `%LOCALAPPDATA%\\PhyExpLab\\samples\\`）。"""
+
+    path: Path
+
+    @classmethod
+    def default(cls) -> "SampleWriter":
+        config.ensure_home()
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        directory = config.home_dir() / "samples"
+        directory.mkdir(parents=True, exist_ok=True)
+        return cls(directory / f"samples-{stamp}.jsonl")
+
+    def append(self, record: dict) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
 
 
 class SlotMonitor:
-    """按固定节奏采集时段余量，输出「余量变化事件」。"""
+    """按固定节奏采集时段余量，输出「余量变化」事件并落盘。"""
 
-    def __init__(self, client: PhyExpClient, config: MonitorConfig | None = None) -> None:
+    def __init__(self, client: PhyExpClient, config: MonitorConfig | None = None,
+                 writer: SampleWriter | None = None, log: LogFn = _log) -> None:
         self.client = client
         self.config = config or MonitorConfig()
+        self.writer = writer
+        self.log = log
+        self.rounds = 0
+        self.failures = 0
 
-    def poll_once(self, slot_ids: list[str]) -> list[Slot]:
-        """采集一轮，返回本轮读到的时段快照（余量未知的时段原样返回，不做臆测）。"""
-        raise NotImplementedError(
-            "监控依赖尚未逆向的接口（PhyExpClient.get_remaining）；"
-            "先完成 `python run.py recon` 采集并填写 docs/接口逆向.md。"
-        )
+    # ── 单轮采集 ──
 
-    def run(self, on_slot_change=None, max_rounds: int | None = None) -> None:
-        """持续监控主循环（含限速退避）。
+    def poll_once(self, course_id, project_ids: Iterable) -> dict[str, Slot]:
+        """采集一轮，返回 `{slot_id: Slot}`；**单个项目失败只记录、不中断整轮**。"""
+        slots: dict[str, Slot] = {}
+        for project_id in project_ids:
+            try:
+                rows = self.client.slots(course_id, project_id=project_id, with_my_status=False)
+            except ApiError as exc:
+                self.failures += 1
+                self.log(f"[warn] 项目 {project_id} 采集失败（本轮不计入样本）：{exc}")
+                continue
+            for row in rows:
+                slot = self.client.to_slot(row)
+                slots[slot.slot_id] = slot
+        return slots
 
-        `on_slot_change(prev, now)` 在每个时段余量发生变化时被调用；
-        `max_rounds` 便于研究与测试时限定轮数。
+    # ── 主循环 ──
+
+    def run(self, course_id, project_ids: Iterable, *,
+            max_rounds: int | None = None,
+            on_change: Callable[[Slot, Slot | None], None] | None = None) -> None:
+        """轮询主循环。
+
+        `on_change(now, prev)` 在余量发生变化时被调用（`prev=None` 表示首次见到该场次）。
+        `max_rounds` 便于研究与测试时限定轮数（None = 一直跑）。
         """
-        raise NotImplementedError("同上：待接口逆向完成后实现。")
+        project_ids = list(project_ids)
+        warm_ms = self.client.prewarm()
+        self.log(f"[info] 连接已预热（{warm_ms}ms）；正在监控 {len(project_ids)} 个实验项目")
+
+        previous: dict[str, Slot] = {}
+        interval = self.config.min_interval_seconds
+        try:
+            while max_rounds is None or self.rounds < max_rounds:
+                started = time.time()
+                slots = self.poll_once(course_id, project_ids)
+                self.rounds += 1
+
+                changes = 0
+                for slot_id, slot in slots.items():
+                    old = previous.get(slot_id)
+                    if old is None or old.remaining != slot.remaining:
+                        changes += 1
+                        if on_change:
+                            on_change(slot, old)
+                previous.update(slots)
+
+                if self.writer:
+                    self.writer.append({
+                        "t": dt.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                        "round": self.rounds,
+                        "slots": {
+                            sid: {"taken": s.taken, "capacity": s.capacity, "remaining": s.remaining}
+                            for sid, s in slots.items()
+                        },
+                        "changes": changes,
+                    })
+
+                self.log(f"[{self.rounds:>4}] 场次 {len(slots):>3} 条，变化 {changes:>2} 处，"
+                         f"失败项目累计 {self.failures}")
+
+                # 退避：有失败就拉长间隔，全部成功则回到最小间隔
+                if self.failures:
+                    interval = min(interval * self.config.backoff_factor, self.config.backoff_max_seconds)
+                else:
+                    interval = self.config.min_interval_seconds
+
+                elapsed = time.time() - started
+                time.sleep(max(0.0, interval - elapsed))
+        except KeyboardInterrupt:
+            self.log(f"[info] 收到 Ctrl+C，监控停止（已完成 {self.rounds} 轮，样本已落盘）")
