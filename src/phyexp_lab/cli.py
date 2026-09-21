@@ -251,6 +251,95 @@ def _cmd_grab(args: argparse.Namespace) -> int:
     return 0
 
 
+def _sampler_pid_path() -> Path:
+    return config.home_dir() / "sampler.pid"
+
+
+def _cmd_watch_bg(args: argparse.Namespace) -> int:
+    """把采样器作为**独立进程**启动（脱离当前会话，长跑用）。
+
+    为什么需要它（2026-09-21 实测）：本环境里"随会话挂着的后台任务"会被中途终止
+    （三次尝试分别只跑完 23、1、3 轮，且都是裸 exit 1、无 traceback）。
+    规律性研究要跑几小时到几天，所以必须让采样器**脱离会话**：
+    独立进程 + 断管输出 + PID 落盘（便于随时停止）。
+    """
+    import subprocess
+
+    config.ensure_home()
+    logs = config.logs_dir()
+    logs.mkdir(parents=True, exist_ok=True)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_path = logs / f"sampler-{stamp}.out.log"
+    err_path = logs / f"sampler-{stamp}.err.log"
+
+    run_py = Path(__file__).resolve().parents[2] / "run.py"
+    cmd = [sys.executable, str(run_py), "watch",
+           "--interval", str(args.interval), "--rounds", str(args.rounds)]
+    if args.projects:
+        cmd += ["--projects", args.projects]
+    if args.course:
+        cmd += ["--course", str(args.course)]
+
+    creationflags = 0
+    if hasattr(subprocess, "DETACHED_PROCESS"):
+        creationflags |= subprocess.DETACHED_PROCESS
+    if hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
+    # 尽量脱离父进程所在的 Job Object（否则父进程结束时可能被连带杀掉）
+    if hasattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB"):
+        creationflags |= subprocess.CREATE_BREAKAWAY_FROM_JOB
+
+    with out_path.open("ab") as out, err_path.open("ab") as err:
+        try:
+            proc = subprocess.Popen(cmd, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                                    creationflags=creationflags, cwd=str(run_py.parent))
+        except OSError as exc:
+            print(f"[警告] 脱离 Job 启动失败（{exc}），改用普通独立进程重试。", file=sys.stderr)
+            creationflags &= ~getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+            proc = subprocess.Popen(cmd, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                                    creationflags=creationflags, cwd=str(run_py.parent))
+
+    _sampler_pid_path().write_text(str(proc.pid), encoding="utf-8")
+    print(f"[完成] 采样器已作为独立进程启动：pid={proc.pid}")
+    print(f"       间隔 {args.interval}s，轮数 {'不限' if args.rounds <= 0 else args.rounds}")
+    print(f"       标准输出 → {out_path}")
+    print(f"       错误输出 → {err_path}")
+    print(f"       进度日志与样本：{config.logs_dir()} 与 {config.home_dir() / 'samples'}")
+    print(f"       停止：python run.py watch-stop")
+    print("[提醒] token 实测 2 小时过期，过期后采样会开始失败；请定期重新登录后再启动。")
+    return 0
+
+
+def _cmd_watch_stop(_args: argparse.Namespace) -> int:
+    """停止独立采样进程（按 PID 文件精确停止，不做通配杀进程）。"""
+    pid_path = _sampler_pid_path()
+    if not pid_path.is_file():
+        print("[跳过] 没有采样器 PID 文件（可能本来就没启动过）。")
+        return 0
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        print(f"[警告] PID 文件无法解析，已删除：{pid_path}", file=sys.stderr)
+        pid_path.unlink(missing_ok=True)
+        return 2
+
+    import subprocess
+
+    result = subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                            capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"[完成] 已停止采样器 pid={pid}")
+    else:
+        message = (result.stdout or "") + (result.stderr or "")
+        if "not found" in message.lower() or "找不到" in message:
+            print(f"[信息] 进程 {pid} 已经不在了（可能已自行结束）。")
+        else:
+            print(f"[警告] 停止失败：{message.strip()[:200]}", file=sys.stderr)
+            return 2
+    pid_path.unlink(missing_ok=True)
+    return 0
+
+
 def _cmd_gui(_args: argparse.Namespace) -> int:
     """启动 PySide6 只读工作台。"""
     try:
@@ -398,15 +487,19 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
         cfg = monitor.MonitorConfig(min_interval_seconds=args.interval)
         writer = None if args.no_save else monitor.SampleWriter.default()
+        # 长跑任务用文件日志：管道被断开时不会静默死在一次 print 上（见 monitor.FileLogger）
+        log_path = config.logs_dir() / f"watch-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+        logger = monitor.FileLogger(log_path)
         if writer:
-            print(f"样本文件 → {writer.path}")
-        mon = monitor.SlotMonitor(client, cfg, writer=writer)
+            logger(f"样本文件 → {writer.path}")
+        logger(f"进度日志 → {log_path}")
+        mon = monitor.SlotMonitor(client, cfg, writer=writer, log=logger)
 
         def on_change(slot, prev) -> None:  # type: ignore[no-untyped-def]
             old = "（首次见到）" if prev is None else str(prev.remaining)
-            print(f"  [变化] 场次 {slot.slot_id} {slot.time_text} "
-                  f"余量 {old} → {slot.remaining}（{slot.taken}/{slot.capacity}）"
-                  f"{' @ ' + slot.location if slot.location else ''}")
+            logger(f"  [变化] 场次 {slot.slot_id} {slot.time_text} "
+                   f"余量 {old} → {slot.remaining}（{slot.taken}/{slot.capacity}）"
+                   f"{' @ ' + slot.location if slot.location else ''}")
 
         mon.run(course_id, project_ids,
                 max_rounds=(None if args.rounds <= 0 else args.rounds),
@@ -579,6 +672,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--rounds", type=int, default=0, help="轮数（默认 0 = 一直跑；研究/测试可设小值）")
     p_watch.add_argument("--timeout", type=float, default=20.0, help="单次请求超时秒数（默认 20）")
     p_watch.add_argument("--no-save", action="store_true", help="不落盘样本（仅打印）")
+
+    p_watch_bg = sub.add_parser("watch-bg", help="把余量采样器作为独立进程长跑（脱离会话）")
+    p_watch_bg.add_argument("--course", default=None, help="课程 id（默认取我该学期第一门课）")
+    p_watch_bg.add_argument("--projects", default=None, help="逗号分隔的实验项目 id（默认全部）")
+    p_watch_bg.add_argument("--interval", type=float, default=60.0, help="轮询间隔秒数（默认 60）")
+    p_watch_bg.add_argument("--rounds", type=int, default=0, help="轮数（默认 0 = 一直跑）")
+
+    sub.add_parser("watch-stop", help="停止独立采样进程")
     return parser
 
 
@@ -594,6 +695,8 @@ def main(argv: list[str] | None = None) -> int:
         "probe": _cmd_probe,
         "snapshot": _cmd_snapshot,
         "watch": _cmd_watch,
+        "watch-bg": _cmd_watch_bg,
+        "watch-stop": _cmd_watch_stop,
         "gui": _cmd_gui,
         "clock": _cmd_clock,
         "grab": _cmd_grab,
@@ -601,7 +704,11 @@ def main(argv: list[str] | None = None) -> int:
         "stop": _cmd_stop,
         "logout": _cmd_logout,
     }
-    return handlers[args.command](args)
+    try:
+        return handlers[args.command](args)
+    except BrokenPipeError:
+        # 输出管道断开时不要抛异常（长跑任务里这会变成"裸 exit 1、无任何线索"）
+        return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -32,6 +32,36 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+class FileLogger:
+    """长跑任务用的进度记录器：**写文件为主，stdout 为辅**。
+
+    为什么必须这样（2026-09-21 实测教训）：把进度只 `print` 到 stdout 的长跑任务，
+    在输出管道被断开后会死在一次写操作上 —— 那时连 traceback 都写不出去，
+    外部只能看到一个"裸 exit code 1"，**排查时毫无线索**。
+    改为：每条进度先落盘（一定成功），再尽力 print；print 失败就永久关掉 stdout，不抛异常。
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.stdout_ok = True
+        self.wrote = 0
+
+    def __call__(self, msg: str) -> None:
+        stamp = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        try:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{stamp} {msg}\n")
+            self.wrote += 1
+        except OSError:
+            pass
+        if self.stdout_ok:
+            try:
+                print(msg, flush=True)
+            except (BrokenPipeError, OSError, ValueError):
+                self.stdout_ok = False
+
+
 @dataclass
 class MonitorConfig:
     """监控参数。默认值刻意保守，优先保证「不被限速/不打扰系统」。"""
