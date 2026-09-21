@@ -120,6 +120,17 @@ def _cmd_recon(args: argparse.Namespace) -> int:
                       use_saved_state=not args.no_saved_state)
 
 
+def _cmd_gui(_args: argparse.Namespace) -> int:
+    """启动 PySide6 只读工作台。"""
+    try:
+        from . import gui
+    except ImportError as exc:
+        print(f"[错误] 未安装 PySide6，无法启动界面：{exc}", file=sys.stderr)
+        print("       安装：pip install PySide6", file=sys.stderr)
+        return 2
+    return gui.main()
+
+
 def _cmd_snapshot(args: argparse.Namespace) -> int:
     """只读采集：课程 → 实验项目 → 场次（含容量/已选人数/余量），落盘为快照 JSON。"""
     import json
@@ -374,6 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="查看数据目录 / 会话 / 采集文件状态")
     sub.add_parser("logout", help="删除本地会话文件")
     sub.add_parser("stop", help="让正在运行的 login/recon 优雅收尾（保存 HAR 后退出）")
+    sub.add_parser("gui", help="启动图形界面（PySide6 只读工作台）")
 
     p_login = sub.add_parser("login", help="打开浏览器登录并保存会话")
     p_login.add_argument("--max-wait", type=int, default=1800,
@@ -428,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         "probe": _cmd_probe,
         "snapshot": _cmd_snapshot,
         "watch": _cmd_watch,
+        "gui": _cmd_gui,
         "stop": _cmd_stop,
         "logout": _cmd_logout,
     }
