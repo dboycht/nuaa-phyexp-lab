@@ -50,7 +50,10 @@ from PySide6.QtCore import QTime
 
 from . import api
 from . import config as app_config
-from . import grabconfig, planner, prompt as prompt_mod, runner, session, theme
+from . import __version__, grabconfig, planner, prompt as prompt_mod, runner, session, theme
+
+#: 仓库地址（「关于」里展示与打开）
+REPO_URL = "https://github.com/dboycht/nuaa-phyexp-lab"
 from .grabconfig import PERIODS, FreeSlot, GrabPlan
 
 GREEN = QColor(0x18, 0x8A, 0x3E)
@@ -334,6 +337,11 @@ class GrabPanel(QDialog):
         self.btn_login.setToolTip("打开浏览器窗口登录（本项目不接触你的密码）；登录成功后会自动刷新场次")
         self.btn_login.clicked.connect(self._start_login)
         title_row.addWidget(self.btn_login)
+        self.btn_about = QPushButton("关于")
+        self.btn_about.setIcon(theme.qicon("info", 15))
+        self.btn_about.setToolTip("版本、仓库地址、数据目录与使用边界（小按钮，随时可查）")
+        self.btn_about.clicked.connect(self.show_about)
+        title_row.addWidget(self.btn_about)
         head_layout.addLayout(title_row)
 
         subtitle = QLabel(theme.muted(
@@ -657,6 +665,84 @@ class GrabPanel(QDialog):
         self._loader.failed.connect(self._on_load_failed)
         self._loader.finished.connect(lambda: self.btn_reload.setEnabled(True))
         self._loader.start()
+
+    def build_about_dialog(self) -> QDialog:
+        """构造「关于」对话框（**只构造不弹出**，方便自检核对内容）。"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("关于 · 抢课面板")
+        dialog.setMinimumWidth(430)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(7)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        logo = QLabel()
+        logo.setPixmap(theme.app_icon(30).pixmap(30, 30))
+        head.addWidget(logo)
+        title = QLabel(f"<b>南航物理实验助手</b>　v{__version__}")
+        title.setObjectName("h1")
+        head.addWidget(title, 1)
+        layout.addLayout(head)
+
+        home = app_config.home_dir()
+        rows = [
+            ("版本", f"{__version__}（配置/日志在运行目录，不入库）"),
+            ("仓库", REPO_URL),
+            ("许可", "见仓库 LICENSE"),
+            ("数据目录", str(home)),
+            ("下载目录", str(app_config.notes_dir())),
+            ("登录方式", "调起浏览器由你自己登录；本项目**不接触你的密码**"),
+            ("写操作", "只有你点「立即抢课/定时抢课」并确认后才写课表；退课同样二次确认"),
+            ("接口依据", "docs/接口逆向.md（从线上前端 bundle 读出并实测）"),
+        ]
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(4)
+        for index, (key, value) in enumerate(rows):
+            name = QLabel(key)
+            name.setObjectName("step")
+            name.setMinimumWidth(64)
+            content = QLabel(str(value))
+            content.setWordWrap(True)
+            content.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            grid.addWidget(name, index, 0, Qt.AlignTop)
+            grid.addWidget(content, index, 1)
+        layout.addLayout(grid)
+
+        note = QLabel(theme.muted(
+            "第三方辅助工具，与学校无关；请遵守物理实验中心的使用规定。"
+            "抢课结果以教务系统为准，工具只如实转述服务端的回应。"))
+        note.setWordWrap(True)
+        note.setObjectName("step")
+        layout.addWidget(note)
+
+        buttons = QHBoxLayout()
+        btn_repo = QPushButton("打开仓库")
+        btn_repo.setIcon(theme.qicon("search", 15))
+        btn_repo.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(REPO_URL)))
+        buttons.addWidget(btn_repo)
+        btn_home = QPushButton("打开数据目录")
+        btn_home.setIcon(theme.qicon("list", 15))
+        btn_home.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(home))))
+        buttons.addWidget(btn_home)
+        buttons.addStretch(1)
+        btn_close = QPushButton("关闭")
+        btn_close.setObjectName("primary")
+        btn_close.clicked.connect(dialog.accept)
+        buttons.addWidget(btn_close)
+        layout.addLayout(buttons)
+        return dialog
+
+    def show_about(self) -> None:
+        """弹出「关于」（自检模式下不弹模态框，只记日志 —— 与其它弹窗同一套规矩）。"""
+        dialog = self.build_about_dialog()
+        if self.suppress_dialogs:
+            self.log_line(f"[对话框-已抑制] 关于：v{__version__}　仓库 {REPO_URL}")
+            dialog.deleteLater()
+            return
+        dialog.exec()
 
     def _show_banner(self, text: str, tooltip: str = "") -> None:
         """在网格卡里显示一条醒目的说明（拉取失败/无数据时用，避免一片空白让人以为坏了）。
@@ -1535,6 +1621,22 @@ class GrabPanel(QDialog):
         viewport_h = scroll.viewport().height()
         expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
                f"内容 {content_h}px > 视口 {viewport_h}px")
+        # ── 「关于」按钮（用户 2026-10-08 要求：加个关于小按钮）──
+        expect("有『关于』小按钮",
+               self.btn_about is not None and self.btn_about.text() == "关于",
+               self.btn_about.text() if self.btn_about else "无")
+        about = self.build_about_dialog()
+        about_text = " ".join(
+            child.text() for child in about.findChildren(QLabel) if child.text())
+        expect("关于里显示当前版本号", __version__ in about_text, about_text[:60])
+        expect("关于里写清仓库地址与写操作边界",
+               REPO_URL in about_text and "不接触你的密码" in about_text,
+               about_text[:80])
+        expect("关于里有下载目录路径", str(app_config.notes_dir()) in about_text,
+               str(app_config.notes_dir()))
+        expect("关于对话框可正常构造/销毁", about.width() > 0)
+        about.deleteLater()
+
         # ── 源码卫生：**不许有重复定义的顶层函数**（后一个会静默覆盖前一个）──
         # 实测教训：脚本重复应用导致 config.py 里出现三个 notes_dir()，改动看起来"没生效"。
         import ast as _ast
