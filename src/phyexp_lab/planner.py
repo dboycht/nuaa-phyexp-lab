@@ -126,8 +126,17 @@ def occupied_from_electives(client: PhyExpClient, semester_id: Any,
 def build_plan(plan_cfg: GrabPlan, *, rows: list[dict], course_id: Any,
                occupied: dict[tuple[str, str], str] | None = None,
                taken_projects: dict[str, str] | None = None,
-               project_names: dict[str, str] | None = None) -> Plan:
-    """用**已拉取的场次行**构建候选（纯函数，便于单测与演练）。"""
+               project_names: dict[str, str] | None = None,
+               occupied_as_covered: bool = True) -> Plan:
+    """用**已拉取的场次行**构建候选（纯函数，便于单测与演练）。
+
+    `occupied_as_covered` 决定 `uncovered` 的口径：
+
+    - `True`（默认，用于**规划展示**）：已占用的时段不算"未覆盖"（因为那是"已经有了"）；
+    - `False`（用于**执行后的核对**）：未覆盖 = **空闲时段 − 已占用的**，
+      即"有候选"**不算**已覆盖 —— 因为候选随时可能提交失败（已满/限流）。
+      ⚠️ 早期版本一律用候选算覆盖，导致"提交全失败也说全覆盖"与"重试轮只跑一轮"两个静默错误。
+    """
     occupied = dict(occupied or {})
     taken_projects = dict(taken_projects or {})
     project_names = dict(project_names or {})
@@ -200,7 +209,7 @@ def build_plan(plan_cfg: GrabPlan, *, rows: list[dict], course_id: Any,
     for key, free in wanted.items():
         if key in occupied:
             continue                      # 已占用的时段不算"未覆盖"，也不需要在候选里
-        if key in covered:
+        if occupied_as_covered and key in covered:
             continue
         published = [r for r in rows
                      if str(r.get("date") or "") == free.date

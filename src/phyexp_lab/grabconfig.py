@@ -130,6 +130,10 @@ class GrabPlan:
     notify: bool = True
     #: 到点自动开抢的目标时刻（本地 HH:MM:SS，配合 --at 使用；None = 手动即时执行）
     target_at: str | None = None
+    #: 到点后的**重试轮数**（2026-10-07 用户确认："重试固定次数后停"）；1 = 只抢一轮
+    retry_rounds: int = 10
+    #: 每一轮之间的间隔秒数（默认 30s：抢课窗口内足够快，又不至于高频打扰系统）
+    retry_interval_seconds: float = 30.0
     #: 提交参数（沿用已按实测校准的 grabber.GrabConfig 默认值）
     submit: dict[str, Any] = field(default_factory=dict)
 
@@ -144,6 +148,10 @@ class GrabPlan:
             raise ConfigError(f"priority 只能是 remaining_desc / date_asc，实际是 {self.priority!r}")
         if self.max_total < 0:
             raise ConfigError(f"max_total 不能为负（0 = 不设上限），实际是 {self.max_total}")
+        if self.retry_rounds < 1:
+            raise ConfigError(f"retry_rounds 至少为 1（只抢一轮），实际是 {self.retry_rounds}")
+        if self.retry_interval_seconds < 0:
+            raise ConfigError(f"retry_interval_seconds 不能为负，实际是 {self.retry_interval_seconds}")
         seen: set[tuple[str, str]] = set()
         for slot in self.free_slots:
             if slot.key in seen:
@@ -166,6 +174,8 @@ class GrabPlan:
             "dry_run": self.dry_run,
             "notify": self.notify,
             "target_at": self.target_at,
+            "retry_rounds": self.retry_rounds,
+            "retry_interval_seconds": self.retry_interval_seconds,
             "submit": self.submit or {
                 "prewarm": True,
                 "pre_fire_offset_ms": 50,
@@ -187,6 +197,8 @@ class GrabPlan:
             dry_run=bool(raw.get("dry_run", True)),
             notify=bool(raw.get("notify", True)),
             target_at=raw.get("target_at"),
+            retry_rounds=int(raw.get("retry_rounds") or 10),
+            retry_interval_seconds=float(raw.get("retry_interval_seconds") or 30.0),
             submit=dict(raw.get("submit") or {}),
         )
         return plan

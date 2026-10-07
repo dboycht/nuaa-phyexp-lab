@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -69,6 +70,8 @@ class RunReport:
     notes: list[str] = field(default_factory=list)
     #: 演练模式下"本应提交"的候选（**不是成功**；单独记，避免把彩排当战果）
     would_submit: list[Candidate] = field(default_factory=list)
+    #: 实际用掉的重试轮数（1 = 只跑了一轮）
+    rounds_used: int = 1
     started_at: dt.datetime = field(default_factory=dt.datetime.now)
     finished_at: dt.datetime | None = None
     aborted_reason: str | None = None
@@ -185,66 +188,127 @@ class Runner:
         taken_slots: list[str] = []
         done = 0
 
-        for index, candidate in enumerate(plan.candidates, 1):
-            if candidate.free_key in occupied:
-                report.skipped.append(f"{candidate.describe()}（该时段已被占）")
-                continue
+        def secured() -> set[tuple[str, str]]:
+            """"真正拿到手"的空闲时段。
+
+            ⚠️ **口径要点（实测踩到的假成功）**：不能拿"有候选"当"已覆盖" ——
+            候选只说明"当时有机会"，提交可能失败（已满/限流）。只有
+            **真实回读确认过**（`occupied`）或**演练中假设成功**（`would_submit`）才算拿到。
+            早期版本用候选算覆盖，导致：① 全部失败也打印"全部覆盖、收工"；
+            ② 重试轮永远只跑一轮。两处都是"看起来正常"的静默错误。
+            """
+            keys = set(occupied)
+            if cfg.dry_run:
+                keys.update(item.free_key for item in report.would_submit)
+            return keys
+
+        def update_uncovered() -> int:
+            """重算"还没拿到的空闲时段"并写明原因，返回还差几个（A5：必须如实）。"""
+            got = secured()
+            rows_now, names_now = planner.load_course_slots(client, course_id)
+            fresh = build_plan(cfg, rows=rows_now, course_id=course_id, occupied=occupied,
+                               taken_projects=taken_projects, project_names=names_now,
+                               occupied_as_covered=False)
+            reason_of = {item.free.key: item.reason for item in fresh.uncovered}
+            pending: list[Uncovered] = []
+            for free in cfg.free_slots:
+                if free.key in got:
+                    continue
+                reason = reason_of.get(free.key) or "该时段当时有候选，但提交未成功（见上方失败明细）"
+                pending.append(Uncovered(free=free, reason=reason))
+            report.uncovered = pending
+            return len(pending)
+
+        def run_round(round_index: int) -> bool:
+            """跑一轮（重新规划 → 逐个提交/演练）。返回 True = 该收工了。"""
+            nonlocal done
+            if round_index > 0:
+                rows_now, names_now = planner.load_course_slots(client, course_id)
+                plan_now = build_plan(cfg, rows=rows_now, course_id=course_id,
+                                      occupied=occupied, taken_projects=taken_projects,
+                                      project_names=names_now)
+                candidates = [c for c in plan_now.candidates if c.free_key not in secured()]
+                self.log(f"[第 {round_index + 1}/{rounds} 轮] 重试剩余未覆盖时段，"
+                         f"本轮候选 {len(candidates)} 个")
+            else:
+                candidates = [c for c in plan.candidates if c.free_key not in secured()]
+
+            for index, candidate in enumerate(candidates, 1):
+                if candidate.free_key in secured():
+                    report.skipped.append(f"{candidate.describe()}（该时段已被占）")
+                    continue
+                if max_total and max_total > 0 and done >= max_total:
+                    report.notes.append(f"达到上限 {max_total}，停止")
+                    return True
+
+                prefix = f"[{index}/{len(candidates)}]" if round_index else f"[{index}/{len(plan.candidates)}]"
+                if cfg.dry_run:
+                    self.log(f"{prefix} [演练] 本应提交 {candidate.describe()}")
+                    report.would_submit.append(candidate)
+                    done += 1
+                    taken_slots.append(candidate.slot_id)
+                    continue
+
+                self.log(f"{prefix} 提交 {candidate.describe()}")
+                result = client.submit_booking(candidate.slot_id, course_id)
+                attempt = Attempt(candidate=candidate, ok=result.ok, outcome=result.outcome.value,
+                                  message=result.message, http_status=result.http_status,
+                                  elapsed_ms=result.elapsed_ms)
+                if not result.ok:
+                    self.log(f"       └ 失败：{result.message[:100]}（继续下一个候选）")
+                    report.attempts.append(attempt)
+                    continue
+
+                # 回读核实（R6）：不拿 HTTP 200 当成功
+                verified, detail, record_id = self._verify(client, semester_id, course_id, candidate)
+                attempt.verified = verified
+                attempt.record_id = record_id
+                if verified:
+                    self.log(f"       └ 服务端已确认：{detail}")
+                    occupied[candidate.free_key] = f"本次提交 slot={candidate.slot_id}"
+                    taken_projects[candidate.project_id] = candidate.project_name
+                    taken_slots.append(candidate.slot_id)
+                    done += 1
+                else:
+                    attempt.ok = False
+                    attempt.outcome = "unverified"
+                    attempt.message = f"HTTP 200 但回读未确认（{detail}）"
+                    self.log(f"       └ ⚠️ 回读未确认：{detail} —— 按**未成功**记录")
+                report.attempts.append(attempt)
+
+                # 每条之间保持最小间隔（合规：低频，沿用实测校准值）
+                if index < len(candidates):
+                    time.sleep(max(0.0, self._submit_interval_seconds()))
+
+            remaining = update_uncovered()
+            if remaining == 0:
+                self.log(f"[满足] 所有空闲时段都已覆盖，收工。")
+                return True
             if max_total and max_total > 0 and done >= max_total:
-                report.notes.append(f"达到上限 {max_total}，停止")
+                return True
+            return False
+
+        rounds = max(1, int(cfg.retry_rounds))
+        if rounds > 1 and not cfg.dry_run:
+            self.log(f"[设置] 到点后最多重试 {rounds} 轮，每轮间隔 {cfg.retry_interval_seconds:.0f} 秒"
+                     f"（用户确认：重试固定次数后停）")
+        for round_index in range(rounds):
+            if round_index > 0:
+                if cfg.dry_run:
+                    break     # 演练只跑一轮：候选与真实一致即可，没必要重复等待
+                wait = max(0.0, float(cfg.retry_interval_seconds))
+                self.log(f"[等待] {wait:.0f} 秒后开始第 {round_index + 1} 轮重试……")
+                try:
+                    time.sleep(wait)
+                except KeyboardInterrupt:
+                    self.log("[中断] 用户取消重试。")
+                    break
+            if run_round(round_index):
                 break
 
-            prefix = f"[{index}/{len(plan.candidates)}]"
-            if cfg.dry_run:
-                self.log(f"{prefix} [演练] 本应提交 {candidate.describe()}")
-                report.would_submit.append(candidate)
-                done += 1
-                taken_slots.append(candidate.slot_id)
-                continue
-
-            self.log(f"{prefix} 提交 {candidate.describe()}")
-            result = client.submit_booking(candidate.slot_id, course_id)
-            attempt = Attempt(candidate=candidate, ok=result.ok, outcome=result.outcome.value,
-                              message=result.message, http_status=result.http_status,
-                              elapsed_ms=result.elapsed_ms)
-            if not result.ok:
-                self.log(f"       └ 失败：{result.message[:100]}（继续下一个候选）")
-                report.attempts.append(attempt)
-                continue
-
-            # 4) 回读核实（R6）：不拿 HTTP 200 当成功
-            verified, detail, record_id = self._verify(client, semester_id, course_id, candidate)
-            attempt.verified = verified
-            attempt.record_id = record_id
-            if verified:
-                self.log(f"       └ 服务端已确认：{detail}")
-                occupied[candidate.free_key] = f"本轮提交 slot={candidate.slot_id}"
-                taken_projects[candidate.project_id] = candidate.project_name
-                taken_slots.append(candidate.slot_id)
-                done += 1
-            else:
-                attempt.ok = False
-                attempt.outcome = "unverified"
-                attempt.message = f"HTTP 200 但回读未确认（{detail}）"
-                self.log(f"       └ ⚠️ 回读未确认：{detail} —— 按**未成功**记录")
-            report.attempts.append(attempt)
-
-            # 每条之间保持最小间隔（合规：低频，沿用实测校准值）
-            if index < len(plan.candidates):
-                import time
-                time.sleep(max(0.0, self._submit_interval_seconds()))
-
-        # 5) 未覆盖的空闲时段：用"最新的占用状态"重算一次（如实报告，A5）
-        #    演练时按"本应提交的那些都成功"来算 —— 否则会把本应覆盖的时段报成未覆盖，自相矛盾。
-        occupied_after = dict(occupied)
-        for item in report.would_submit:
-            occupied_after[item.free_key] = "演练：本应提交"
-        rows_after, names_after = planner.load_course_slots(client, course_id)
-        plan_after = build_plan(cfg, rows=rows_after, course_id=course_id,
-                                occupied=occupied_after,
-                                taken_projects=taken_projects, project_names=names_after)
-        report.uncovered = list(plan_after.uncovered)
         if taken_slots:
-            report.notes.append(f"本轮提交的场次：{', '.join(taken_slots)}")
+            report.notes.append(f"本次提交的场次：{', '.join(taken_slots)}")
+        report.rounds_used = round_index + 1
         report.finished_at = dt.datetime.now()
         return self._finish(report)
 
