@@ -103,6 +103,7 @@ ICONS = {
     "undo": "\uE7A7",
     "target": "\uE1D3",
     "shield": "\uEA18",
+    "download": "\uE896",
     "lab": "\uE9D9",
 }
 

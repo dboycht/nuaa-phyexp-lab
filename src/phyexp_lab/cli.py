@@ -68,6 +68,49 @@ def _cmd_version(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_papers(args: argparse.Namespace) -> int:
+    """批量下载实验笔记（报告纸）PDF。
+
+    接口取自线上前端「下载」按钮：`report-api/report_paper/<选课记录 id>`（**只读**）。
+    默认只下"两周窗口内已选"的；`--all` 下全部已选；`--ids` 指定记录 id。
+    """
+    from . import api, planner      # 与其它子命令一致：用到时再导入
+
+    client = api.PhyExpClient(timeout=30.0)
+    try:
+        semester = client.open_semesters()[0]
+        course_id = (args.course if getattr(args, "course", None) is not None
+                     else client.my_courses(semester["id"])[0]["id"])
+        elections = planner.my_elections(client, semester["id"], course_id)
+        if args.ids:
+            wanted = {str(x).strip() for x in str(args.ids).split(",") if str(x).strip()}
+            items = [e for e in elections if str(e.get("record_id")) in wanted]
+        elif args.all:
+            items = elections
+        else:
+            today = dt.date.today()
+            window = set(planner.planned_days(today, weeks=2))
+            items = [e for e in elections if e["date"] in window]
+        if not items:
+            print("[说明] 没有要下载的实验（可用 --all 下载全部已选，或 --ids 指定记录 id）。")
+            return 0
+
+        dest = Path(args.out) if getattr(args, "out", None) else config.notes_dir()
+        print(f"[下载] {len(items)} 份 → {dest}")
+        ok = 0
+        for index, item in enumerate(items, 1):
+            result = client.download_report_paper(
+                item.get("record_id"), dest, index=index, date=item["date"],
+                period=item["period"], name=item["name"])
+            print(f"  [{index}/{len(items)}] {'✓' if result.ok else '✗'} "
+                  f"{item['date']} {item['period']}【{item['name']}】→ {result.message}")
+            ok += 1 if result.ok else 0
+        print(f"[完成] 成功 {ok} 份，失败 {len(items) - ok} 份；目录：{dest}")
+        return 0 if ok == len(items) else 1
+    finally:
+        client.close()
+
+
 def _cmd_status(_args: argparse.Namespace) -> int:
     home = config.home_dir()
     state = session.state_path()
@@ -1140,6 +1183,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("version", help="查看版本与目标系统")
+    p_papers = sub.add_parser("papers", help="批量下载实验笔记（报告纸）PDF")
+    p_papers.add_argument("--all", action="store_true", help="下载我全部已选的实验（默认只下两周窗口内的）")
+    p_papers.add_argument("--ids", default="", help="只下这些选课记录 id（逗号分隔）")
+    p_papers.add_argument("--out", default="", help="输出目录（默认运行目录下的 notes/）")
+    p_papers.add_argument("--course", type=int, default=None, help="课程 id（默认我的第一门课）")
     sub.add_parser("status", help="查看数据目录 / 会话 / 采集文件状态")
     sub.add_parser("logout", help="删除本地会话文件")
     sub.add_parser("stop", help="让正在运行的 login/recon 优雅收尾（保存 HAR 后退出）")
@@ -1278,6 +1326,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     handlers = {
         "version": _cmd_version,
+        "papers": _cmd_papers,
         "status": _cmd_status,
         "login": _cmd_login,
         "recon": _cmd_recon,

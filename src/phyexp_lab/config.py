@@ -125,3 +125,18 @@ def stop_flag_path() -> Path:
 
 def logs_dir() -> Path:
     return home_dir() / "logs"
+
+
+def notes_dir() -> Path:
+    """实验笔记/报告纸 PDF 的默认下载目录（运行期数据，**绝不进仓库**）。"""
+    return home_dir() / "notes"
+
+
+def notes_dir() -> Path:
+    """实验笔记/报告纸 PDF 的默认下载目录（运行期数据，**绝不进仓库**）。"""
+    return home_dir() / "notes"
+
+
+def notes_dir() -> Path:
+    """实验笔记/报告纸 PDF 的默认下载目录（运行期数据，**绝不进仓库**）。"""
+    return home_dir() / "notes"

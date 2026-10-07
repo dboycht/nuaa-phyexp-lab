@@ -25,8 +25,8 @@ import time
 import traceback
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -565,6 +565,12 @@ class GrabPanel(QDialog):
         self.btn_cancel_picks.setEnabled(False)
         self.btn_cancel_picks.clicked.connect(self.cancel_picked)
         bottom.addWidget(self.btn_cancel_picks)
+        self.btn_download = QPushButton("下载实验笔记")
+        self.btn_download.setIcon(theme.qicon("download", 15))
+        self.btn_download.setToolTip("把勾选的选课（一条都没勾则下载本周期内全部已选）"
+                                     "的实验笔记 PDF 下载到本地")
+        self.btn_download.clicked.connect(self.download_papers)
+        bottom.addWidget(self.btn_download)
         result_layout.addLayout(bottom)
         # 结果卡吃掉左列剩余高度（用户 2026-10-08：不要留空白垃圾区域）——
         # 网格卡按内容自适应（内部不留空），结果卡随窗口变高，勾选列表也跟着变高。
@@ -1342,6 +1348,54 @@ class GrabPanel(QDialog):
         self.picks_hint.setText(f"本轮抢到 {len(self._results)} 条；勾选要退掉的，再点右侧按钮")
         self.btn_cancel_picks.setEnabled(True)
 
+    def _papers_to_download(self) -> list[dict]:
+        """要下载的实验：**勾选的**已选行；一条都没勾就退回到"本周期内全部已选"。"""
+        checked = [election for box, election in getattr(self, "mine_boxes", []) if box.isChecked()]
+        if checked:
+            return checked
+        return list(getattr(self, "_elections_in_window", []))
+
+    def download_papers(self) -> None:
+        """批量下载实验笔记 PDF（用户 2026-10-08 要求）。
+
+        接口取自线上前端「下载」按钮：`report-api/report_paper/<选课记录 id>`。
+        """
+        worker = getattr(self, "_paper_worker", None)
+        if worker is not None and worker.isRunning():
+            self._info("正在下载", "上一批还没下完，请稍等。")
+            return
+        items = [e for e in self._papers_to_download() if e.get("record_id") is not None]
+        if not items:
+            self._info("没有可下载的实验",
+                       "请先勾选本周期内已选的实验（或先在表格里选时段并抢到课）。")
+            return
+        dest = app_config.notes_dir()
+        self.log_line("")
+        self.log_line(f"[下载] 共 {len(items)} 份实验笔记 PDF → {dest}")
+        self.btn_download.setEnabled(False)
+        self._paper_worker = PaperWorker(items, dest, self.client_factory)
+        self._paper_worker.progress.connect(self.log_line)
+        self._paper_worker.finished_all.connect(self._on_papers_done)
+        self._paper_worker.start()
+
+    def _on_papers_done(self, results: list) -> None:
+        """下载收尾：如实报成功/失败，成功就打开目录（用户 2026-10-08）。"""
+        self.btn_download.setEnabled(True)
+        ok = [result for _item, result in results if getattr(result, "ok", False)]
+        bad = [(item, result) for item, result in results if not getattr(result, "ok", False)]
+        dest = app_config.notes_dir()
+        self.log_line(f"[下载完成] 成功 {len(ok)} 份，失败 {len(bad)} 份；目录：{dest}")
+        for item, result in bad:
+            self.log_line(f"       ✗ {item['date']} {item['period']}：{result.message}")
+        if ok:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(dest)))
+        if bad:
+            self._warn("部分下载失败",
+                       "\n".join(f"- {item['date']} {item['period']}：{r.message}"
+                                  for item, r in bad)[:600])
+        else:
+            self._info("下载完成", f"{len(ok)} 份实验笔记已保存到：\n{dest}")
+
     def cancel_picked(self) -> None:
         """退掉**勾选的**条目：本轮抢到的（Attempt）+ 本周期内已有的选课（按记录 id）。
 
@@ -1481,6 +1535,31 @@ class GrabPanel(QDialog):
         viewport_h = scroll.viewport().height()
         expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
                f"内容 {content_h}px > 视口 {viewport_h}px")
+        # ── 下载实验笔记（用户 2026-10-08 新增功能）──
+        expect("有『下载实验笔记』按钮",
+               self.btn_download is not None and "下载" in self.btn_download.text(),
+               self.btn_download.text() if self.btn_download else "无")
+        checked_items = self._papers_to_download()
+        expect("未勾选时下载本周期内全部已选",
+               len(checked_items) == len(getattr(self, "_elections_in_window", [])),
+               f"{len(checked_items)} vs {len(getattr(self, '_elections_in_window', []))}")
+        if getattr(self, "mine_boxes", None):
+            self.mine_boxes[0][0].setChecked(True)
+            picked_items = self._papers_to_download()
+            expect("勾选后只下载勾选的那条",
+                   len(picked_items) == 1
+                   and picked_items[0] is self.mine_boxes[0][1],
+                   f"条数={len(picked_items)}")
+            self.mine_boxes[0][0].setChecked(False)
+        expect("报告纸地址与前端一致",
+               api.PhyExpClient.paper_url("https://x/api", 195922)
+               == "https://x/api/report-api/report_paper/195922",
+               api.PhyExpClient.paper_url("https://x/api", 195922))
+        naive_name = api.PhyExpClient.paper_filename(1, "2026-10-12", "下午7、8节", r'a/b\c:d*e?f"g<h>i|j')
+        expect("PDF 文件名不含 Windows 非法字符",
+               not set(naive_name) & set('\\/:*?"<>|') and naive_name.endswith(".pdf"),
+               naive_name)
+
         # ── 「停止」必须真的能停（用户 2026-10-08 实测报的 bug：点了还继续重试/提交）──
         # 根因：取消标志只在导入期等待循环里被检查，引擎的重试循环完全不看它。
         class _RecordingEngine:
@@ -1806,6 +1885,44 @@ class GrabPanel(QDialog):
         # 把**总项数**打在结论行里：只数输出里的 [PASS] 会被日志截断而少算（实测踩到）
         self.log_line(f"SELF-CHECK PASSED（共 {checked} 项检查）")
         return 0
+
+
+class PaperWorker(QThread):
+    """后台批量下载实验笔记 PDF（**网络操作绝不放在界面线程**）。"""
+
+    progress = Signal(str)
+    finished_all = Signal(list)          # list[tuple[dict, DownloadResult]]
+
+    def __init__(self, items: list[dict], dest_dir, client_factory) -> None:
+        super().__init__()
+        self.items = items
+        self.dest_dir = dest_dir
+        self.client_factory = client_factory
+
+    def run(self) -> None:  # noqa: D102 - QThread 入口
+        client = None
+        results: list[tuple[dict, object]] = []
+        try:
+            client = self.client_factory()
+            total = len(self.items)
+            for index, item in enumerate(self.items, 1):
+                self.progress.emit(f"[{index}/{total}] 下载 {item['date']} "
+                                   f"{item['period']}【{item['name']}】……")
+                result = client.download_report_paper(
+                    item.get("record_id"), self.dest_dir, index=index,
+                    date=item.get("date", ""), period=item.get("period", ""),
+                    name=item.get("name", ""))
+                results.append((item, result))
+                self.progress.emit(f"       └ {'✓' if result.ok else '✗'} {result.message}")
+        except Exception as exc:  # noqa: BLE001 - 线程里必须自己兜异常
+            self.progress.emit(f"[下载失败] {type(exc).__name__}：{exc}")
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self.finished_all.emit(results)
 
 
 class DemoClient:

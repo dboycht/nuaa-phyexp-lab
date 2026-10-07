@@ -34,6 +34,8 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import json
+import pathlib
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -74,6 +76,16 @@ def friendly_message(body_text: str) -> str:
         code = data.get("code")
         return f"{message.strip()}（服务端 code={code}）" if code is not None else message.strip()
     return (body_text or "").strip()
+
+
+@dataclass
+class DownloadResult:
+    """一次 PDF 下载的结果（成功与否、落到哪、多大、给人看的一句话）。"""
+
+    ok: bool
+    path: pathlib.Path | None
+    size: int
+    message: str
 
 
 @dataclass(frozen=True)
@@ -219,6 +231,57 @@ class PhyExpClient:
         # 连接预热：实测不预热首次要付 ~1250ms(TLS)，预热后稳态 ~11ms
         self._http = http
         self._prewarmed = False
+
+    # ── 实验笔记 / 报告纸 PDF ──
+
+    @staticmethod
+    def paper_url(base_url: str, record_id: Any) -> str:
+        """报告纸 PDF 的地址（前端「下载」按钮用的就是它；`record_id` = user2projects.id）。"""
+        return f"{base_url.rstrip('/')}/report-api/report_paper/{record_id}"
+
+    @staticmethod
+    def paper_filename(index: int, date: str, period: str, name: str) -> str:
+        """给下载下来的 PDF 起个**人能认出来**的文件名（不依赖服务端 Content-Disposition）。
+
+        例：`01_2026-10-12_下午7、8节_分光计调节与棱镜折射率的测量（531）.pdf`
+        非法字符（`/ \ : * ? " < > |`）替换成 `_`，Windows 上才不会写失败。
+        """
+        raw = f"{index:02d}_{date}_{period}_{name}"
+        safe = re.sub(r'[\\/:*?"<>|]+', "_", raw).strip(" .")
+        return f"{safe[:120]}.pdf"
+
+    def download_report_paper(self, record_id: Any, dest_dir: pathlib.Path, *,
+                              index: int = 1, date: str = "", period: str = "",
+                              name: str = "") -> DownloadResult:
+        """下载一条选课记录的报告纸 PDF（**只读**；前端「下载」按钮的同一接口）。
+
+        判据（都不许靠"HTTP 200 就算成功"这一条）：
+          - HTTP 200；内容以 `%PDF` 开头；长度 > 1KB。
+        文件名优先按"序号_日期_节次_科目.pdf"，重名自动加 `-2`（**不覆盖**已有文件）。
+        """
+        url = self.paper_url(self.base_url, record_id)
+        try:
+            # ⚠️ 必须走**同一个会话**：网关要 User-Agent/Referer/Cookie，裸 requests 会 502
+            resp = self._http.get(url, timeout=max(self.timeout, 30.0))
+        except Exception as exc:  # noqa: BLE001
+            return DownloadResult(False, None, 0, f"请求失败（{type(exc).__name__}）：{exc}")
+        if resp.status_code == 401:
+            return DownloadResult(False, None, 0, "401 未授权：token 可能已过期，请重新登录")
+        if resp.status_code != 200:
+            return DownloadResult(False, None, 0, f"HTTP {resp.status_code}：{(resp.text or '')[:80]}")
+        blob = resp.content
+        if not blob[:4].startswith(b"%PDF"):
+            return DownloadResult(False, None, 0,
+                                  f"返回的不是 PDF（开头 {blob[:16]!r}，{len(blob)} 字节）")
+        dest_dir = pathlib.Path(dest_dir)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        target = dest_dir / self.paper_filename(index, date, period, name)
+        stem, suffix, counter = target.stem, target.suffix, 2
+        while target.exists():                       # 不覆盖：加 -2、-3……
+            target = dest_dir / f"{stem}-{counter}{suffix}"
+            counter += 1
+        target.write_bytes(blob)
+        return DownloadResult(True, target, len(blob), f"已保存 {target.name}（{len(blob) // 1024} KB）")
 
     def prewarm(self) -> int:
         """预热连接，返回耗时（毫秒）。抢课/批量采集前先调一次。"""
