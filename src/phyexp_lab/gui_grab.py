@@ -19,6 +19,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import pathlib
+import sys
 import traceback
 from typing import Any, Callable
 
@@ -52,9 +54,6 @@ GREEN = QColor(0x18, 0x8A, 0x3E)
 RED = QColor(0xC0, 0x39, 0x2B)
 GREY = QColor(0x88, 0x88, 0x88)
 AMBER = QColor(0xB5, 0x6A, 0x00)
-
-#: 单元格状态 → 中文短标签（配色统一由 `theme.CELL_STYLES` 提供，这里只管文字）
-STATE_TEXT = {"full": "已满", "taken": "已选", "all_taken": "已做过", "none": "—"}
 
 
 # ── 子线程 ──
@@ -106,9 +105,15 @@ class GridLoader(QThread):
 
 
 class GrabWorker(QThread):
-    """执行抢课（可选等待到点）。**真实提交由面板的勾选框控制**（默认演练）。"""
+    """执行抢课（可选等待到点）。**真实提交由面板的勾选框控制**（默认演练）。
+
+    阶段通过 `phase` 信号上报主线程（`阶段名, 剩余秒数`），界面据此显示倒计时：
+    `waiting`（等待到点）→ `fetching`（到点，拉取场次列表并筛候选）→
+    `submitting`（逐条提交）→ `done`。
+    """
 
     progress = Signal(str)
+    phase = Signal(str, float)
     finished_report = Signal(object)
     failed = Signal(str)
 
@@ -133,14 +138,21 @@ class GrabWorker(QThread):
                     remain = self.wait_until_epoch - dt.datetime.now().timestamp()
                     if remain <= 0.2:
                         break
-                    self.progress.emit(f"等待到点：还剩 {int(remain)} 秒……")
-                    self.msleep(1000)
+                    self.phase.emit("waiting", remain)
+                    self.msleep(200)
                 if self._cancel:
                     self.progress.emit("已取消等待。")
+                    self.phase.emit("cancelled", 0.0)
                     return
+            # 到点：**重新拉取实时场次列表**再筛候选（窗口未开时看到的"未放出"到这里才有数据）
+            self.phase.emit("fetching", 0.0)
+            self.progress.emit("到点：正在拉取场次列表并筛选候选……")
+            self.phase.emit("submitting", 0.0)
             report = engine.run()
+            self.phase.emit("done", 0.0)
             self.finished_report.emit(report)
         except Exception as exc:  # noqa: BLE001
+            self.phase.emit("error", 0.0)
             self.failed.emit(f"{type(exc).__name__}：{exc}\n{traceback.format_exc()[:600]}")
         finally:
             if client is not None:
@@ -148,6 +160,17 @@ class GrabWorker(QThread):
                     client.close()
                 except Exception:  # noqa: BLE001
                     pass
+
+
+def format_countdown(seconds: float) -> str:
+    """把剩余秒数格式化成 `HH:MM:SS`（负数/超大值都按 0 处理，不显示怪值）。
+
+    纯函数 ⇒ 可单测；界面与日志共用同一份格式，避免"两处各算一套"。
+    """
+    total = max(0, int(seconds + 0.999))     # 向上取整：还剩 0.4 秒显示 00:00:01，不是 00:00:00
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 # ── 面板 ──
@@ -159,8 +182,13 @@ class GrabPanel(QDialog):
     def __init__(self, parent: QWidget | None = None, *,
                  client_factory: Callable[[], Any] | None = None,
                  plan_cfg: GrabPlan | None = None,
-                 auto_reload: bool = True) -> None:
+                 auto_reload: bool = True,
+                 suppress_dialogs: bool = False) -> None:
         super().__init__(parent)
+        #: 自检模式必须置 True：**模态对话框在没人点的时候会永远等下去**
+        #: （实测：自检卡在 _on_report 的 QMessageBox 上；与 ERROR.md E13 同一类问题 ——
+        #:  自检与真实运行共用逻辑时，一切"需要人"的副作用都要能关掉）。
+        self.suppress_dialogs = suppress_dialogs
         self.setWindowTitle("抢课面板（两周空闲时段 → 到点自动抢 → 结果可退课）")
         self.resize(1180, 1000)
         self.setMinimumSize(980, 640)   # 允许缩到小屏也能用（实测提醒：不留余量时最小高度会顶到 1053）
@@ -216,6 +244,11 @@ class GrabPanel(QDialog):
         self.chip_window.setObjectName("chip")
         for chip in (self.chip_login, self.chip_course, self.chip_window):
             title_row.addWidget(chip)
+        self.btn_login = QPushButton("登录")
+        self.btn_login.setIcon(theme.qicon("shield", 15))
+        self.btn_login.setToolTip("打开浏览器窗口登录（本项目不接触你的密码）；登录成功后会自动刷新场次")
+        self.btn_login.clicked.connect(self._start_login)
+        title_row.addWidget(self.btn_login)
         head_layout.addLayout(title_row)
 
         subtitle = QLabel(theme.muted(
@@ -292,6 +325,16 @@ class GrabPanel(QDialog):
         self.btn_clear.clicked.connect(self.clear_selection)
         actions.addWidget(self.btn_clear)
         actions.addStretch(1)
+        # 阶段 + 大号倒计时（用户流程：登录 → 倒计时 → 到点拉列表提交）
+        self.lbl_phase = QLabel("待机")
+        self.lbl_phase.setObjectName("chip")
+        actions.addWidget(self.lbl_phase)
+        self.lbl_countdown = QLabel("")
+        self.lbl_countdown.setStyleSheet(
+            f"color: {theme.ACTIVE.primary}; font-size: 15pt; font-weight: bold;"
+            f"font-family: '{theme.MONO_FONTS[0]}'; background: transparent;")
+        self.lbl_countdown.setToolTip("距离开抢的剩余时间（按服务端时钟对时换算）")
+        actions.addWidget(self.lbl_countdown)
         self.selection_label = QLabel("已选 0 个时段")
         self.selection_label.setObjectName("chip")
         actions.addWidget(self.selection_label)
@@ -314,6 +357,13 @@ class GrabPanel(QDialog):
         grid_box.setFont(theme.ui_font(10, QFont.DemiBold))
         grid_outer = QVBoxLayout(grid_box)
         grid_outer.setContentsMargins(10, 8, 10, 10)
+        hint = QLabel(theme.muted(
+            "点格子 = 标记「这个时段我有空」（与当前有没有课无关）；"
+            "格子里的小字是**当前可见情况**，窗口未开时大多显示「未放出」属正常。"
+            "到点开抢时会**重新拉取实时列表**再筛候选。"))
+        hint.setWordWrap(True)
+        hint.setObjectName("step")
+        grid_outer.addWidget(hint)
         self.grid_host = QWidget()
         self.grid = QGridLayout(self.grid_host)
         self.grid.setSpacing(4)
@@ -431,6 +481,115 @@ class GrabPanel(QDialog):
             chip.style().unpolish(chip)      # 改了 objectName 必须重刷，否则样式不会变
             chip.style().polish(chip)
 
+    # ── 对话框小助手（自检模式下全部短路，避免模态框把自检挂死）──
+
+    def _info(self, title: str, text: str) -> None:
+        if self.suppress_dialogs:
+            self.log_line(f"[对话框-已抑制] {title}：{text.splitlines()[0][:80]}")
+            return
+        QMessageBox.information(self, title, text)
+
+    def _warn(self, title: str, text: str) -> None:
+        if self.suppress_dialogs:
+            self.log_line(f"[对话框-已抑制] {title}：{text.splitlines()[0][:80]}")
+            return
+        QMessageBox.warning(self, title, text)
+
+    def _critical(self, title: str, text: str) -> None:
+        if self.suppress_dialogs:
+            self.log_line(f"[对话框-已抑制] {title}：{text.splitlines()[0][:80]}")
+            return
+        QMessageBox.critical(self, title, text)
+
+    def _ask(self, title: str, text: str, *, default_yes: bool = False) -> bool:
+        """二次确认。自检模式下**默认按"否"**（安全一侧）并记日志。"""
+        if self.suppress_dialogs:
+            self.log_line(f"[对话框-已抑制] {title}：默认按{'是' if default_yes else '否'}处理")
+            return default_yes
+        answer = QMessageBox.question(
+            self, title, text,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes if default_yes else QMessageBox.No)
+        return answer == QMessageBox.Yes
+
+    # ── 阶段与倒计时 ──
+
+    def _on_phase(self, name: str, remain: float) -> None:
+        """把工作线程的阶段映射到界面（用户流程：等待 → 到点拉列表 → 提交）。"""
+        if name == "waiting":
+            self._set_chip(self.lbl_phase, "等待开抢", "chipWarn")
+            self.lbl_countdown.setText(format_countdown(remain))
+        elif name == "fetching":
+            self._set_chip(self.lbl_phase, "到点：拉取场次列表", "chipWarn")
+            self.lbl_countdown.setText("00:00:00")
+        elif name == "submitting":
+            self._set_chip(self.lbl_phase, "提交中", "chipWarn")
+        elif name == "done":
+            self._set_chip(self.lbl_phase, "已完成", "chipOk")
+            self.lbl_countdown.setText("")
+        elif name == "cancelled":
+            self._set_chip(self.lbl_phase, "已取消", "chip")
+            self.lbl_countdown.setText("")
+        elif name == "error":
+            self._set_chip(self.lbl_phase, "出错", "chipDanger")
+            self.lbl_countdown.setText("")
+
+    # ── 登录 ──
+
+    def _start_login(self) -> None:
+        """打开登录流程（Playwright 浏览器窗口），登录成功后自动刷新网格。
+
+        为什么用子进程：登录需要真实浏览器交互（本项目**不接触密码**），
+        复用已验证的 `run.py login`，而不是在界面里重写一遍。
+        """
+        import subprocess
+
+        if getattr(self, "_login_proc", None) is not None and self._login_proc.poll() is None:
+            self.log_line("[登录] 已经有一个登录窗口在运行。")
+            return
+        run_py = pathlib.Path(__file__).resolve().parents[2] / "run.py"
+        cmd = [sys.executable, str(run_py), "login", "--max-wait", "900"]
+        self.log_line(f"[登录] 正在打开浏览器窗口：{' '.join(cmd)}")
+        try:
+            self._login_proc = subprocess.Popen(cmd, cwd=str(run_py.parent),
+                                                stdout=subprocess.DEVNULL,
+                                                stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            self.log_line(f"[登录] 启动失败（{type(exc).__name__}）：{exc}")
+            return
+        self._set_chip(self.chip_login, "登录态：等待你在浏览器里登录…", "chipWarn")
+        self.btn_login.setEnabled(False)
+        if not hasattr(self, "_login_timer"):
+            self._login_timer = QTimer(self)
+            self._login_timer.setInterval(2000)
+            self._login_timer.timeout.connect(self._poll_login)
+        self._login_wait_seconds = 0
+        self._login_timer.start()
+
+    def _poll_login(self) -> None:
+        """轮询登录结果：token 有效即认为登录完成。"""
+        self._login_wait_seconds = getattr(self, "_login_wait_seconds", 0) + 2
+        token = session.load_token()
+        described = session.describe_token(token) if token else "无 token"
+        if token and "已过期" not in described:
+            self._login_timer.stop()
+            self.btn_login.setEnabled(True)
+            self._set_chip(self.chip_login, f"登录态：{described[:28]}", "chipOk")
+            self.log_line(f"[登录] 已登录：{described}")
+            self.reload()
+            return
+        proc = getattr(self, "_login_proc", None)
+        if proc is not None and proc.poll() is not None:
+            self._login_timer.stop()
+            self.btn_login.setEnabled(True)
+            self._set_chip(self.chip_login, "登录态：未登录/已过期", "chipDanger")
+            self.log_line(f"[登录] 窗口已关闭（退出码 {proc.returncode}），"
+                          f"仍未检测到有效登录态。")
+            return
+        if self._login_wait_seconds % 30 == 0:
+            self.log_line(f"[登录] 等待登录中……已等 {self._login_wait_seconds} 秒")
+        self._set_chip(self.chip_login, f"登录态：等待登录（{self._login_wait_seconds}s）", "chipWarn")
+
     def _on_load_failed(self, message: str) -> None:
         self._set_chip(self.chip_login, "登录态：不可用", "chipDanger")
         self.log_line(f"[加载失败] {message}")
@@ -458,12 +617,23 @@ class GrabPanel(QDialog):
         self._set_chip(self.chip_course, f"课程：{course_name or payload['course_id']}")
         days = self.days()
         self._set_chip(self.chip_window, f"窗口：{days[0][5:]} ~ {days[-1][5:]}（两周）")
-        self.log_line(f"已加载：课程 id={payload['course_id']}，可约单元 {avail} 个，"
+        self.log_line(f"已加载：课程 id={payload['course_id']}，当前可见可约单元 {avail} 个，"
                       f"已有选课 {taken} 个，已做过实验 {len(payload['taken'])} 个")
         if avail == 0:
-            self.log_line("       提示：当前窗口内没有可约单元（可能都满了、或都做过了）。")
-        # 已选时段若在新数据里不再是"可约"，要剔除（避免提交一个已经满了的场次）
-        self.selected = {key for key in self.selected if self.cells.get(key, {}).get("state") == "available"}
+            self.log_line("       注意：现在看不到可约单元，**这在窗口未开时是正常的** ——"
+                          "你照常点选空闲时段即可，到点后系统会按当时的实时余量重新筛候选。")
+        # ⚠️ **不要**因为"当前不可见/已满"就把用户已选的空闲时段剔掉 —— 那等于把用户的设置丢了。
+        #    选的是"我什么时候有空"，与"现在有什么课"是两件事（用户 2026-10-07 的纠正）。
+        dropped = 0
+        for key in sorted(self.selected):
+            state = (self.cells.get(key) or {}).get("state")
+            if state == "taken":
+                dropped += 1
+                self.log_line(f"       提示：{key[0]} {key[1]} 你已有选课，该时段不会再选新的。")
+            elif state == "all_taken":
+                dropped += 1
+                self.log_line(f"       提示：{key[0]} {key[1]} 的实验你都做过了，到点不会有候选。")
+        del dropped
         self._rebuild_grid()
 
     def _rebuild_grid(self) -> None:
@@ -517,53 +687,84 @@ class GrabPanel(QDialog):
             self.grid.addWidget(name, row, 0)
             for index, date in enumerate(days):
                 key = (date, period)
-                info = self.cells.get(key) or {"state": "none", "remaining": 0, "total": 0,
-                                               "best_slot_id": None, "project_name": "", "reason": ""}
-                button = QPushButton(self._button_text(info))
-                button.setCheckable(info["state"] == "available")
-                button.setChecked(key in self.selected)
-                button.setToolTip(self._button_tip(key, info))
+                info = self.cells.get(key) or {}
+                selected = key in self.selected
+                # 所有格子都**可点选**（选的是"我的空闲时段"，与当前有没有课无关）
+                button = QPushButton(self._button_text(info, selected=selected))
+                button.setCheckable(True)
+                button.setChecked(selected)
+                button.setCursor(Qt.PointingHandCursor)
+                button.setToolTip(self._button_tip(key, info, selected=selected))
                 button.setMinimumHeight(36)      # 36px：5 个节次在默认窗口里能一次看全（40px 会差 31px，需滚动）
                 button.setMinimumWidth(62)
-                if info["state"] == "available":
-                    button.setStyleSheet(theme.cell_qss(
-                        "selected" if key in self.selected else "available"))
-                    button.clicked.connect(lambda _checked=False, k=key: self.toggle_cell(k))
-                else:
-                    button.setEnabled(False)
-                    button.setStyleSheet(theme.cell_qss(info["state"]))
+                state = "selected" if selected else self._cell_state(info)
+                button.setStyleSheet(theme.cell_qss(state))
+                button.clicked.connect(lambda _checked=False, k=key: self.toggle_cell(k))
                 self.grid.addWidget(button, row, columns[index])
                 self.buttons[key] = button
         self._update_selection_label()
 
     @staticmethod
-    def _button_text(info: dict) -> str:
-        if info["state"] == "available":
-            return f"可约\n余 {info['remaining']}"
-        return STATE_TEXT.get(info["state"], "—")
+    def _cell_state(info: dict) -> str:
+        """未选中时按"当前可见情况"决定底色；没有数据时用 none。"""
+        return str(info.get("state") or "none")
 
     @staticmethod
-    def _button_tip(key: tuple[str, str], info: dict) -> str:
-        head = f"{key[0]} {key[1]}\n状态：{info['state']}"
-        if info["state"] == "available":
-            return (f"{head}\n余量 {info['remaining']}（共 {info['total']} 个场次）\n"
-                    f"实验：{info['project_name']}\n场次 id：{info['best_slot_id']}")
-        return f"{head}\n原因：{info.get('reason') or '不可选'}"
+    def _button_text(info: dict, *, selected: bool = False) -> str:
+        """格子文字：**已选**优先显示（那才是用户真正设置的东西），当前可见情况作副行。"""
+        state = str(info.get("state") or "none")
+        hint = ""
+        if state == "available":
+            hint = f"余 {info.get('remaining')}"
+        elif state == "full":
+            hint = "当前已满"
+        elif state == "taken":
+            hint = "已有选课"
+        elif state == "all_taken":
+            hint = "已做过"
+        else:
+            hint = "未放出"
+        if selected:
+            return f"✓ 已选\n{hint}"
+        return hint if state != "available" else f"可约\n余 {info.get('remaining')}"
+
+    @staticmethod
+    def _button_tip(key: tuple[str, str], info: dict, *, selected: bool = False) -> str:
+        state = str(info.get("state") or "none")
+        head = f"{key[0]} {key[1]}\n" + ("已选为我的空闲时段\n" if selected else "未选中\n")
+        current = {
+            "available": f"当前可约：余量 {info.get('remaining')}（共 {info.get('total')} 个场次）"
+                         f"\n实验：{info.get('project_name')}\n场次 id：{info.get('best_slot_id')}",
+            "full": "当前已满",
+            "taken": f"你在这个时段已有选课（{info.get('reason') or ''}）",
+            "all_taken": "这个节次的实验你都做过了",
+            "none": "当前看不到这个节次的场次（窗口未开/未排课 —— **属正常**）",
+        }.get(state, state)
+        return (f"{head}当前可见情况：{current}\n\n"
+                "点一下即可把它设为/取消『我的空闲时段』；\n"
+                "真正的候选会在**到点执行时**按当时的实时余量重新筛选。")
 
     # ── 点选 ──
 
     def toggle_cell(self, key: tuple[str, str]) -> None:
-        info = self.cells.get(key) or {}
-        if info.get("state") != "available":
-            return
+        """点选/取消"我的空闲时段"。
+
+        ⚠️ **设计要点（2026-10-07 用户纠正）**：选空闲时段**与"当前能不能约"无关** ——
+        用户配置的时候往往**还看不到有哪些课**（只有到点才放出来），
+        所以显示 `—`（当前不可见）的格子**也必须能点选**；
+        网格上的余量/状态只是"当前可见情况"的参考，真正的候选在**到点执行时**按实时数据重算。
+        （早期版本只允许点选 `available` 的格子 ⇒ 到点前的时段全都点不动，属于设计缺陷。）
+        """
         if key in self.selected:
             self.selected.discard(key)
         else:
             self.selected.add(key)
         button = self.buttons.get(key)
         if button is not None:
-            button.setStyleSheet(theme.cell_qss("selected" if key in self.selected else "available"))
-            button.setChecked(key in self.selected)
+            info = self.cells.get(key) or {}
+            state = "selected" if key in self.selected else self._cell_state(info)
+            button.setStyleSheet(theme.cell_qss(state))
+            button.setText(self._button_text(info, selected=key in self.selected))
         self._update_selection_label()
 
     def select_all_available(self) -> None:
@@ -635,15 +836,12 @@ class GrabPanel(QDialog):
         try:
             plan.validate()
         except grabconfig.ConfigError as exc:
-            QMessageBox.warning(self, "配置有误", str(exc))
+            self._warn("配置有误", str(exc))
             return
         if not plan.dry_run:
-            answer = QMessageBox.question(
-                self, "确认真实提交",
-                f"即将**真实提交** {len(plan.free_slots)} 个空闲时段的选课，会写进你的课表。\n"
-                f"重试轮数 {plan.retry_rounds}，每轮间隔 {plan.retry_interval_seconds:.0f} 秒。\n\n确认继续？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if answer != QMessageBox.Yes:
+            if not self._ask("确认真实提交",
+                             f"即将**真实提交** {len(plan.free_slots)} 个空闲时段的选课，会写进你的课表。\n"
+                             f"重试轮数 {plan.retry_rounds}，每轮间隔 {plan.retry_interval_seconds:.0f} 秒。\n\n确认继续？"):
                 self.log_line("[已取消] 未开始。")
                 return
         wait_until = self.target_epoch()
@@ -655,8 +853,10 @@ class GrabPanel(QDialog):
                       f"重试 {plan.retry_rounds} 轮 × {plan.retry_interval_seconds:.0f}s")
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self._on_phase("waiting" if wait_until else "submitting", 0.0)
         self._worker = GrabWorker(plan, wait_until_epoch=wait_until, client_factory=self.client_factory)
         self._worker.progress.connect(self.log_line)
+        self._worker.phase.connect(self._on_phase)
         self._worker.finished_report.connect(self._on_report)
         self._worker.failed.connect(self._on_grab_failed)
         self._worker.finished.connect(self._on_worker_done)
@@ -673,7 +873,7 @@ class GrabPanel(QDialog):
 
     def _on_grab_failed(self, message: str) -> None:
         self.log_line(f"[抢课失败] {message}")
-        QMessageBox.critical(self, "抢课失败", message[:500])
+        self._critical("抢课失败", message[:500])
 
     def _on_report(self, report) -> None:
         self._results = list(report.succeeded)
@@ -684,10 +884,9 @@ class GrabPanel(QDialog):
             self.log_line("  " + line)
         self._rebuild_picks()
         if not report.dry_run:
-            QMessageBox.information(
-                self, "抢课完成",
-                f"成功 {len(report.succeeded)} 个，失败 {len(report.failed)} 个，"
-                f"未覆盖时段 {len(report.uncovered)} 个。\n详见下方结果区。")
+            self._info("抢课完成",
+                       f"成功 {len(report.succeeded)} 个，失败 {len(report.failed)} 个，"
+                       f"未覆盖时段 {len(report.uncovered)} 个。\n详见下方结果区。")
 
     def _rebuild_picks(self) -> None:
         while self.picks_layout.count():
@@ -715,14 +914,12 @@ class GrabPanel(QDialog):
     def cancel_picked(self) -> None:
         picked = [attempt for box, attempt in getattr(self, "pick_boxes", []) if box.isChecked()]
         if not picked:
-            QMessageBox.information(self, "未选择", "请先勾选要退掉的条目。")
+            self._info("未选择", "请先勾选要退掉的条目。")
             return
         names = "\n".join(f"- {a.candidate.date} {a.candidate.period} {a.candidate.project_name}"
                           for a in picked)
-        answer = QMessageBox.question(self, "确认退课",
-                                      f"即将退掉以下 {len(picked)} 条（不可撤销）：\n\n{names}\n\n确认？",
-                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if answer != QMessageBox.Yes:
+        if not self._ask("确认退课",
+                         f"即将退掉以下 {len(picked)} 条（不可撤销）：\n\n{names}\n\n确认？"):
             self.log_line("[已取消] 未退课。")
             return
         engine = runner.Runner(self.build_plan_from_ui(apply_selection=False),
@@ -825,6 +1022,48 @@ class GrabPanel(QDialog):
                f"内容 {content_h}px > 视口 {viewport_h}px")
         expect("结果占位区高度够放 3 行", self.result_text.height() >= 66,
                f"高度 {self.result_text.height()}px")
+
+        # ── 本轮最关键的用户要求（2026-10-07 用户纠正）──
+        # 配置的时候往往**看不到有哪些课**（窗口未开）⇒ "未放出"的时段也必须能选，
+        # 而且刷新数据后**不能把用户已选的时段丢掉**。
+        unpub = [k for k, v in self.cells.items() if v["state"] == "none"]
+        if unpub:
+            key = unpub[0]
+            self.toggle_cell(key)
+            expect("未放出的时段也能选中", key in self.selected, str(key))
+            expect("未放出的时段进入计划",
+                   key in {s.key for s in self.build_plan_from_ui().free_slots},
+                   str([s.key for s in self.build_plan_from_ui().free_slots]))
+            self._on_loaded(payload_holder)          # 模拟"刷新数据"
+            expect("刷新后已选时段不丢", key in self.selected, str(sorted(self.selected)))
+            self.toggle_cell(key)
+            expect("可取消选中", key not in self.selected)
+        else:
+            expect("存在『未放出』的时段样本（用于验证可选中）", False,
+                   "当前窗口已放全，换一天再跑更能覆盖此路径")
+
+        # ── 用户流程的关键序列：等待(倒计时) → 到点拉取列表 → 提交 → 完成 ──
+        # 直接同步跑一次 GrabWorker（3 秒后到点），断言阶段**按顺序**出现。
+        phases: list[str] = []
+        wait_plan = self.build_plan_from_ui()
+        wait_plan.dry_run = True
+        worker = GrabWorker(wait_plan, wait_until_epoch=dt.datetime.now().timestamp() + 3.0,
+                            client_factory=self.client_factory)
+        worker.phase.connect(lambda name, remain: phases.append(name))
+        worker.run()                      # 同步执行（自检不需要事件循环）
+        expect("阶段序列含 waiting（倒计时）", "waiting" in phases, str(phases))
+        expect("到点先 fetching（拉取列表）再 submitting（提交）",
+               "fetching" in phases and "submitting" in phases
+               and phases.index("fetching") < phases.index("submitting"), str(phases))
+        expect("结束上报 done", phases and phases[-1] == "done", str(phases))
+
+        # 倒计时格式（纯函数；界面与日志共用同一份）
+        expect("倒计时 0 秒", format_countdown(0) == "00:00:00", format_countdown(0))
+        expect("倒计时 65 秒", format_countdown(65) == "00:01:05", format_countdown(65))
+        expect("倒计时 3661 秒", format_countdown(3661) == "01:01:01", format_countdown(3661))
+        expect("倒计时向上取整（还剩 0.4s 显示 1 秒）", format_countdown(0.4) == "00:00:01",
+               format_countdown(0.4))
+        expect("倒计时负数按 0 处理", format_countdown(-5) == "00:00:00", format_countdown(-5))
         avail_h = (self.screen() or QApplication.primaryScreen()).availableGeometry().height()
         expect("窗口最小高度能缩进可用工作区", self.minimumSizeHint().height() < avail_h - 40,
                f"最小 {self.minimumSizeHint().height()} vs 工作区 {avail_h}")
@@ -938,10 +1177,10 @@ def main(argv: list[str] | None = None) -> int:
         # auto_reload=False：不装 200ms 定时器，避免自检里被非守护线程拖住（见 __init__ 的说明）
         panel = GrabPanel(client_factory=DemoClient,
                           plan_cfg=GrabPlan(dry_run=True, notify=False),
-                          auto_reload=False)
+                          auto_reload=False, suppress_dialogs=True)
         # 自检模式不显示窗口，也不依赖事件循环里的定时器
         code = panel.self_check()
-        print("\n".join(panel.log.toPlainText().splitlines()[-40:]))
+        print("\n".join(panel.log.toPlainText().splitlines()[-70:]))
         return code
     panel = GrabPanel()
     panel.show()
