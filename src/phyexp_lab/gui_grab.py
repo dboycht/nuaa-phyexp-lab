@@ -816,8 +816,9 @@ class GrabPanel(QDialog):
         window = set(self.days())
         inside = [e for e in elections if e["date"] in window]
         outside = [e for e in elections if e["date"] not in window]
-        self._rebuild_mine_list(inside)
-        self.mine_title.setText(f"本周期内已选（{len(inside)} 个）")
+        self._elections_in_window = inside      # 供"待抢"列表与勾选退课复用
+        self._refresh_mine_rows()
+        self.mine_title.setText(f"本周期管理（已选 {len(inside)} · 待抢 {len(self._pending_slots())}）")
         tips: list[str] = []
         if outside:
             tips.append("窗口外的已选：" +
@@ -1025,16 +1026,21 @@ class GrabPanel(QDialog):
             button.setStyleSheet(theme.cell_qss(state))
             button.setText(self._button_text(info, selected=key in self.selected))
         self._update_selection_label()
+        # ⚠️ 这里必须刷新左下角的**管理列表**：点格子（或列表里的 ×）就是在改"准备抢的时段"，
+        #    不刷新的话列表会与网格不一致（实测：门禁"点 × 后不再出现在待抢里"抓到了这个漏）。
+        self._refresh_mine_rows()
 
     def select_all_available(self) -> None:
         for key, info in self.cells.items():
             if info["state"] == "available" and key not in self.selected:
                 self.selected.add(key)
         self._rebuild_grid()
+        self._refresh_mine_rows()     # 左下角"待抢"列表要跟着变
 
     def clear_selection(self) -> None:
         self.selected.clear()
         self._rebuild_grid()
+        self._refresh_mine_rows()     # 左下角"待抢"列表要跟着变
 
     def _refresh_start_button(self, *_args) -> None:
         """按钮文案直接写出**将要执行哪种模式**（立即 / 定时等到几点）。
@@ -1172,49 +1178,118 @@ class GrabPanel(QDialog):
 
     @staticmethod
     def _row_text(row) -> str:
-        """把一行列表的文字拼起来（自检用来核对内容）。"""
+        """把一行列表的文字拼起来（自检用来核对内容）；富文本先剥标签，便于断言纯文字。"""
+        import re as _re
+
         parts: list[str] = []
         for child in row.findChildren(QLabel):
-            text = child.text().strip()
+            text = _re.sub(r"<[^>]+>", "", child.text()).strip()
             if text:
                 parts.append(text)
         return " ".join(parts)
 
-    def _rebuild_mine_list(self, inside: list[dict]) -> None:
-        """把"本周期内已选"渲染成**一行一条的列表**（用户 2026-10-08 要求）。
+    @staticmethod
+    def _tag(text: str, color: str) -> QLabel:
+        """行首的小标签（已选 / 待抢）——固定宽度，让两类行对齐。"""
+        label = QLabel(text)
+        label.setStyleSheet(f"color: {color}; font-size: 8pt;")
+        label.setMinimumWidth(26)
+        label.setAlignment(Qt.AlignCenter)
+        return label
 
-        每行：`[图标] 日期 节次 · 科目名`；"日期 节次"固定宽度对齐，科目名占剩余宽度。
+    def _pending_slots(self) -> list[tuple[str, str]]:
+        """我设为空闲、且落在窗口内、还没拿到课的时段（= 列表里的"待抢"行）。"""
+        window = set(self.days())
+        booked = {(e["date"], e["period"]) for e in getattr(self, "_elections_in_window", [])}
+        return sorted(k for k in self.selected if k[0] in window and k not in booked)
+
+    def _refresh_mine_rows(self) -> None:
+        """按当前点选重画左下角管理列表（点格子/全选/清空后都要跟着变）。"""
+        if not hasattr(self, "mine_layout"):
+            return
+        self._rebuild_mine_list(list(getattr(self, "_elections_in_window", [])),
+                                self._pending_slots())
+        inside = len(getattr(self, "_elections_in_window", []))
+        self.mine_title.setText(
+            f"本周期管理（已选 {inside} · 待抢 {len(self._pending_slots())}）")
+
+    def _rebuild_mine_list(self, inside: list[dict], pending: list[tuple[str, str]]) -> None:
+        """本周期**管理列表**（用户 2026-10-08）：
+
+        - 已选行：带复选框（勾上 = 准备退掉），行尾写科目名；
+        - 待抢行：当前你设为空闲、准备抢的时段（窗口内），带 × 可随时从计划里去掉。
         """
         while self.mine_layout.count():
             item = self.mine_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
-        if not inside:
-            empty = QLabel(theme.muted("（本周期内还没有已选课）"))
+        self.mine_boxes = []
+        if not inside and not pending:
+            empty = QLabel(theme.muted("（本周期内既没有已选课，也还没选空闲时段）"))
             empty.setObjectName("step")
             self.mine_layout.addWidget(empty)
             self.mine_layout.addStretch(1)
+            self._update_cancel_button()
+            QTimer.singleShot(0, self._fit_mine_height)
             return
         for election in inside:
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
             row_layout.setSpacing(6)
-            icon = QLabel()
-            icon.setPixmap(theme.icon_pixmap("check", 13, theme.ACTIVE.taken))
-            row_layout.addWidget(icon)
+            box = QCheckBox()
+            box.setToolTip("勾上 = 准备退掉这条选课；再点右下角「退掉勾选项」")
+            box.stateChanged.connect(self._update_cancel_button)
+            row_layout.addWidget(box)
+            row_layout.addWidget(self._tag("已选", theme.ACTIVE.taken))
             when = QLabel(f"{election['date'][5:]} {election['period']}")
             when.setObjectName("step")
             when.setMinimumWidth(96)          # 对齐用：日期 + 节次
             row_layout.addWidget(when)
             name = QLabel(election["name"])
-            name.setToolTip(f"{election['date']} {election['period']}　{election['name']}")
+            name.setToolTip(f"{election['date']} {election['period']}　{election['name']}"
+                            f"\n选课记录 id={election.get('record_id')}")
             row_layout.addWidget(name, 1)
             self.mine_layout.addWidget(row)
+            self.mine_boxes.append((box, election))
+        for date, period in pending:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            spacer = QLabel()
+            spacer.setFixedWidth(14)          # 与"已选"行的复选框对齐
+            row_layout.addWidget(spacer)
+            row_layout.addWidget(self._tag("待抢", theme.ACTIVE.primary))
+            when = QLabel(f"{date[5:]} {period}")
+            when.setObjectName("step")
+            when.setMinimumWidth(96)
+            row_layout.addWidget(when)
+            note = QLabel(theme.muted("准备抢：到点按实时余量选"))
+            note.setToolTip("这是你设为空闲、准备抢的时段；点右侧 × 可把它从计划里去掉")
+            row_layout.addWidget(note, 1)
+            drop = QPushButton("×")
+            drop.setFixedWidth(24)
+            drop.setToolTip("把这个时段从「我的空闲时段」里去掉")
+            drop.clicked.connect(lambda _checked=False, k=(date, period): self.toggle_cell(k))
+            row_layout.addWidget(drop)
+            self.mine_layout.addWidget(row)
         self.mine_layout.addStretch(1)
+        self._update_cancel_button()
         # 按内容定高（延后一拍再量：布局未结算时 sizeHint 会偏小，见网格那次同款教训）
         QTimer.singleShot(0, self._fit_mine_height)
+
+    def _update_cancel_button(self, *_args) -> None:
+        """退课按钮的可用性/文案：**本轮抢到的**与**已有选课**都可勾选后退掉。"""
+        picked = [box for box, _ in getattr(self, "pick_boxes", []) if box.isChecked()]
+        mine = [box for box, _ in getattr(self, "mine_boxes", []) if box.isChecked()]
+        total = len(picked) + len(mine)
+        self.btn_cancel_picks.setEnabled(total > 0)
+        if total:
+            self.picks_hint.setText(f"已勾选 {total} 条待退（本轮 {len(picked)} + 已有选课 {len(mine)}）")
+        else:
+            self.picks_hint.setText("勾选要退掉的条目（本轮抢到的 / 本周期内已选的），再点右侧按钮")
 
     def _on_report(self, report) -> None:
         self._results = list(report.succeeded)
@@ -1254,25 +1329,44 @@ class GrabPanel(QDialog):
         self.btn_cancel_picks.setEnabled(True)
 
     def cancel_picked(self) -> None:
+        """退掉**勾选的**条目：本轮抢到的（Attempt）+ 本周期内已有的选课（按记录 id）。
+
+        两条路径共用同一套判据：调 `/cancel` → 回读核实确实消失（HTTP 成功不算数）。
+        """
         picked = [attempt for box, attempt in getattr(self, "pick_boxes", []) if box.isChecked()]
-        if not picked:
-            self._info("未选择", "请先勾选要退掉的条目。")
+        mine = [election for box, election in getattr(self, "mine_boxes", []) if box.isChecked()]
+        if not picked and not mine:
+            self._info("未选择", "请先勾选要退掉的条目（本轮抢到的 / 本周期内已选的）。")
             return
-        names = "\n".join(f"- {a.candidate.date} {a.candidate.period} {a.candidate.project_name}"
-                          for a in picked)
+        names = "\n".join(
+            [f"- [本轮] {a.candidate.date} {a.candidate.period} {a.candidate.project_name}"
+             for a in picked] +
+            [f"- [已选] {e['date']} {e['period']} {e['name']}" for e in mine])
         if not self._ask("确认退课",
-                         f"即将退掉以下 {len(picked)} 条（不可撤销）：\n\n{names}\n\n确认？"):
+                         f"即将退掉以下 {len(picked) + len(mine)} 条（不可撤销）：\n\n{names}\n\n确认？"):
             self.log_line("[已取消] 未退课。")
             return
         engine = runner.Runner(self.build_plan_from_ui(apply_selection=False),
                                client=self.client_factory(), log=self.log_line)
+        cancelled: list[dict] = []
         try:
             for attempt in picked:
                 ok, detail = engine.cancel_pick(attempt)
                 self.log_line(f"  {'✓' if ok else '✗'} {attempt.candidate.date} "
                               f"{attempt.candidate.period}：{detail}")
+            for election in mine:
+                label = f"{election['date']} {election['period']} {election['name']}"
+                ok, detail = engine.cancel_record(election.get("record_id"), label=label)
+                self.log_line(f"  {'✓' if ok else '✗'} {label}：{detail}")
+                if ok:
+                    cancelled.append(election)
         finally:
             engine.close()
+        if cancelled:                      # 本地先摘掉退成功的，界面立刻反映（复核仍可点刷新）
+            remaining = [e for e in getattr(self, "_elections_in_window", [])
+                         if e not in cancelled]
+            self._elections_in_window = remaining
+            self._refresh_mine_rows()
         self.log_line("复核请点「刷新场次」。")
 
     # ── 自检（无鼠标、无真实账号）──
@@ -1393,15 +1487,17 @@ class GrabPanel(QDialog):
         row_texts = [self._row_text(w) for w in rows if w is not None]
         today_mmdd = dt.date.today().strftime("%m-%d")
         outside_day = (dt.date.today() + dt.timedelta(days=35)).strftime("%m-%d")
-        expect("左下角是列表（每行一个已选，不是一整串文字）",
-               len(row_texts) == 1 and today_mmdd in row_texts[0],
+        selected_rows = [t for t in row_texts if "已选" in t]
+        expect("左下角是列表：已选单独成行（不是一整串文字）",
+               len(selected_rows) == 1 and today_mmdd in selected_rows[0],
                str(row_texts))
         expect("列表行含日期+节次+科目名",
                bool(row_texts) and today_mmdd in row_texts[0]
                and "上午1、2节" in row_texts[0] and "磁阻传感器与地磁场测量" in row_texts[0],
                str(row_texts))
-        expect("标题写明本周期内已选数量",
-               "本周期内已选（1 个）" in self.mine_title.text(), self.mine_title.text())
+        expect("标题写明本周期内的已选与待抢数量",
+               self.mine_title.text().startswith("本周期管理（已选 1 · 待抢"),
+               self.mine_title.text())
         expect("窗口外的已选不进列表",
                all(outside_day not in t and "分压限流电路" not in t for t in row_texts),
                str(row_texts))
@@ -1411,6 +1507,44 @@ class GrabPanel(QDialog):
                self.mine_title.toolTip()[:70])
         expect("左下角列表高度合理（不抢结果区）", 24 <= self.mine_scroll.height() <= 120,
                f"高 {self.mine_scroll.height()}px")
+        # ── 左下角是**管理列表**：已选可勾选退课 + 待抢也在里面（用户 2026-10-08）──
+        expect("左下角有已选行且带复选框", bool(self.mine_boxes)
+               and isinstance(self.mine_boxes[0][0], QCheckBox),
+               f"行数={len(self.mine_boxes)}")
+        # 注意：本轮的 picks 可能已经把按钮置为可用（自检前面跑过真实路径），
+        # 所以这里断言的是"勾选**进入**待退统计"，而不是"按钮从禁用变可用"。
+        self.mine_boxes[0][0].setChecked(True)
+        expect("勾选已有选课后退课按钮可用", self.btn_cancel_picks.isEnabled(),
+               f"是否可用={self.btn_cancel_picks.isEnabled()}")
+        expect("勾选后提示把『已有选课』计入待退",
+               "待退" in self.picks_hint.text() and "已有选课 1" in self.picks_hint.text(),
+               self.picks_hint.text())
+        self.mine_boxes[0][0].setChecked(False)
+        expect("取消勾选后该条不再计入待退",
+               "已有选课 1" not in self.picks_hint.text(), self.picks_hint.text())
+        # 待抢行：把两个窗口内的时段设为空闲后应出现在列表里
+        win = self.days()
+        self.selected.add((win[1], PERIODS[1]))
+        self._refresh_mine_rows()
+        row_texts2 = [self._row_text(self.mine_layout.itemAt(i).widget())
+                      for i in range(self.mine_layout.count())
+                      if self.mine_layout.itemAt(i).widget() is not None]
+        expect("待抢时段出现在管理列表里",
+               any("待抢" in t and win[1][5:] in t for t in row_texts2), str(row_texts2)[:120])
+        expect("标题的待抢数量与实际待抢一致",
+               f"待抢 {len(self._pending_slots())}" in self.mine_title.text(),
+               f"{self.mine_title.text()} | _pending_slots={self._pending_slots()}")
+        # × 按钮能把该时段从计划里去掉
+        self.toggle_cell((win[1], PERIODS[1]))
+        leftover = [self._row_text(self.mine_layout.itemAt(i).widget())
+                    for i in range(self.mine_layout.count())
+                    if self.mine_layout.itemAt(i).widget() is not None]
+        # 注意：同一天可能有别的待抢时段 —— 必须**日期+节次**一起比，只比日期会误判
+        expect("取消该时段后它不再出现在待抢里",
+               not any("待抢" in t and win[1][5:] in t and PERIODS[1] in t for t in leftover),
+               str(leftover)[:140])
+        expect("取消该时段后它也不在空闲计划里",
+               (win[1], PERIODS[1]) not in self.selected, str(sorted(self.selected))[:80])
         # 列表高度要**贴内容**（不留空白尾）：框高不该明显超过内容
         self._fit_mine_height()
         expect("左下角列表高度贴合内容（无空白尾）",

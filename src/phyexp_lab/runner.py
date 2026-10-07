@@ -395,6 +395,35 @@ class Runner:
         self._notify(report)
         return report
 
+    def cancel_record(self, record_id: Any, *, slot_id: Any = None,
+                      label: str = "") -> tuple[bool, str]:
+        """按**选课记录 id** 退掉一条（用于退掉"已有的选课"，不只是本轮抢到的）。
+
+        与 `cancel_pick` 共用同一套判据：调 `/cancel` → **回读核实该记录确实消失**
+        （HTTP 成功不算数）。`slot_id` 只用于回读时的二次核对与提示文案。
+        """
+        if record_id is None:
+            return False, "没有选课记录 id，无法退课"
+        client = self._client_or_create()
+        result = client.cancel_booking(record_id)
+        if not result.ok:
+            return False, f"退课接口返回失败：{result.message[:80]}"
+        semesters = client.open_semesters()
+        if not semesters:
+            return True, f"退课已提交（{label}），但无开放学期可复核"
+        semester_id = semesters[0].get("id")
+        cid = self.cfg.course_id
+        if cid is None:
+            courses = client.my_courses(semester_id)
+            cid = courses[0].get("id") if courses else None
+        if cid is None:
+            return True, f"退课已提交（{label}），但拿不到课程 id 无法复核"
+        for record in client.my_electives(semester_id, cid):
+            if str(record.get("id")) == str(record_id):
+                return False, f"回读仍看到该选课记录（id={record_id}）—— 按未成功处理"
+        suffix = f"（slot={slot_id}）" if slot_id is not None else ""
+        return True, f"已确认退掉 {label}{suffix}"
+
     def cancel_pick(self, attempt: Attempt, *, course_id: Any | None = None) -> tuple[bool, str]:
         """退掉刚抢到的一条（**写操作**）：先查 `user2projects.id`，再 `/cancel`，最后回读核实。"""
         from . import planner
