@@ -401,10 +401,12 @@ class GrabPanel(QDialog):
         self.selection_label = QLabel("已选 0 个时段")
         self.selection_label.setObjectName("chip")
         actions.addWidget(self.selection_label)
-        self.btn_start = QPushButton("开始抢课")
-        self.btn_start.setIcon(theme.qicon("play", 15, "white"))
+        self.btn_start = QPushButton("立即抢课")
         self.btn_start.setObjectName("primary")
-        self.btn_start.setMinimumWidth(120)
+        self.btn_start.setMinimumWidth(170)      # 容得下"定时抢课（等到 10:00:00）"
+        # 文案 = 当前模式（用户 2026-10-08）：勾「到点开抢」前是"立即"，勾上后写明等到几点
+        self.time_enable.toggled.connect(self._refresh_start_button)
+        self.time_edit.timeChanged.connect(self._refresh_start_button)
         self.btn_start.clicked.connect(self.start_grab)
         actions.addWidget(self.btn_start)
         self.btn_stop = QPushButton("停止")
@@ -932,12 +934,27 @@ class GrabPanel(QDialog):
         self.selected.clear()
         self._rebuild_grid()
 
+    def _refresh_start_button(self, *_args) -> None:
+        """按钮文案直接写出**将要执行哪种模式**（立即 / 定时等到几点）。
+
+        为什么：模式原本只由一个勾选框决定，同一个"开始抢课"按钮有两种行为，
+        用户不易看出当前是哪一种（用户 2026-10-08 就问了"是有两种窗口吗"）。
+        文案随模式变，最省地方也最直白。
+        """
+        if self.time_enable.isChecked():
+            moment = self.time_edit.time().toString("HH:mm:ss")
+            self.btn_start.setText(f"定时抢课（等到 {moment}）")
+        else:
+            self.btn_start.setText("立即抢课")
+        count = len(self.selected)
+        self.btn_start.setEnabled(bool(count) and not self._is_busy())
+
     def _update_selection_label(self) -> None:
         count = len(self.selected)
         self.selection_label.setText(f"已选 {count} 个时段")
         self._set_chip(self.selection_label, f"已选 {count} 个时段",
                        "chipOk" if count else "chip")
-        self.btn_start.setEnabled(bool(count) and not self._is_busy())
+        self._refresh_start_button()
 
     def selected_free_slots(self) -> list[FreeSlot]:
         return [FreeSlot(date=date, period=period) for date, period in sorted(self.selected)]
@@ -1024,7 +1041,7 @@ class GrabPanel(QDialog):
 
     def _on_worker_done(self) -> None:
         self.btn_stop.setEnabled(False)
-        self.btn_start.setEnabled(bool(self.selected))
+        self._refresh_start_button()
 
     def _on_grab_failed(self, message: str) -> None:
         self.log_line(f"[抢课失败] {message}")
@@ -1094,7 +1111,11 @@ class GrabPanel(QDialog):
         """脚本化自检：装配 → 点选 → 演练抢课 → 断言状态转移。返回 0 = 通过。"""
         problems: list[str] = []
 
+        checked = 0
+
         def expect(name: str, condition: bool, detail: str = "") -> None:
+            nonlocal checked
+            checked += 1
             self.log_line(f"[{'PASS' if condition else 'FAIL'}] {name}" +
                           (f" -- {detail}" if detail and not condition else ""))
             if not condition:
@@ -1182,6 +1203,19 @@ class GrabPanel(QDialog):
         viewport_h = scroll.viewport().height()
         expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
                f"内容 {content_h}px > 视口 {viewport_h}px")
+        # 按钮文案必须随模式变（用户 2026-10-08 的要求，防回归）
+        self.time_enable.setChecked(False)
+        self._refresh_start_button()
+        expect("不勾时按钮写『立即抢课』", "立即" in self.btn_start.text(), self.btn_start.text())
+        self.time_enable.setChecked(True)
+        self.time_edit.setTime(QTime(21, 30, 0))
+        self._refresh_start_button()
+        expect("勾上后按钮写『定时』并带出时刻",
+               "定时" in self.btn_start.text() and "21:30:00" in self.btn_start.text(),
+               self.btn_start.text())
+        self.time_enable.setChecked(False)
+        self._refresh_start_button()
+
         expect("结果占位区高度够放 2 行", self.result_text.height() >= 40,
                f"高度 {self.result_text.height()}px")
 
@@ -1353,9 +1387,10 @@ class GrabPanel(QDialog):
 
         self.log_line("")
         if problems:
-            self.log_line(f"SELF-CHECK FAILED: {len(problems)} -> {problems}")
+            self.log_line(f"SELF-CHECK FAILED: {len(problems)}/{checked} -> {problems}")
             return 1
-        self.log_line("SELF-CHECK PASSED")
+        # 把**总项数**打在结论行里：只数输出里的 [PASS] 会被日志截断而少算（实测踩到）
+        self.log_line(f"SELF-CHECK PASSED（共 {checked} 项检查）")
         return 0
 
 
@@ -1462,7 +1497,7 @@ def main(argv: list[str] | None = None) -> int:
                           auto_reload=False, suppress_dialogs=True)
         # 自检模式不显示窗口，也不依赖事件循环里的定时器
         code = panel.self_check()
-        print("\n".join(panel.log.toPlainText().splitlines()[-70:]))
+        print("\n".join(panel.log.toPlainText().splitlines()))   # 全部打印，不再截尾
         return code
     panel = GrabPanel()
     panel.show()
