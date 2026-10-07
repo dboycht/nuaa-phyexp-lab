@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import pathlib
 import sys
+import time
 import traceback
 from typing import Any, Callable
 
@@ -129,13 +130,24 @@ class GrabWorker(QThread):
         self._cancel = False
 
     def cancel(self) -> None:
+        """请求停止：置位 + **透传给引擎**。
+
+        ⚠️ 原来只置位自己的标志，而引擎的重试循环根本不看它 ⇒ 点了「停止」仍会继续
+        重试并提交（用户 2026-10-08 实测报上来的 bug）。
+        """
         self._cancel = True
+        engine = getattr(self, "_engine", None)
+        if engine is not None:
+            engine.cancel()
 
     def run(self) -> None:  # noqa: D102 - QThread 入口
         client = None
         try:
             client = self.client_factory()
             engine = runner.Runner(self.plan_cfg, client=client, log=self.progress.emit)
+            self._engine = engine          # 供 cancel() 透传（停止要能在重试循环里生效）
+            if self._cancel:               # 起线程前就点了停止
+                engine.cancel()
             if self.wait_until_epoch:
                 while not self._cancel:
                     remain = self.wait_until_epoch - dt.datetime.now().timestamp()
@@ -152,7 +164,8 @@ class GrabWorker(QThread):
             self.progress.emit("到点：正在拉取场次列表并筛选候选……")
             self.phase.emit("submitting", 0.0)
             report = engine.run()
-            self.phase.emit("done", 0.0)
+            # 被停止 vs 正常跑完：界面阶段要区分（否则"点了停止"还显示"已完成"）
+            self.phase.emit("cancelled" if getattr(report, "cancelled", False) else "done", 0.0)
             self.finished_report.emit(report)
         except Exception as exc:  # noqa: BLE001
             self.phase.emit("error", 0.0)
@@ -1146,7 +1159,8 @@ class GrabPanel(QDialog):
     def stop_grab(self) -> None:
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
-            self.log_line("[停止] 已请求停止（正在进行的请求会跑完）。")
+            self.log_line("[停止] 已请求停止：正在进行的那一条请求会跑完，"
+                          "之后**不再提交、不再重试**。")
 
     def _on_worker_done(self) -> None:
         self.btn_stop.setEnabled(False)
@@ -1467,6 +1481,37 @@ class GrabPanel(QDialog):
         viewport_h = scroll.viewport().height()
         expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
                f"内容 {content_h}px > 视口 {viewport_h}px")
+        # ── 「停止」必须真的能停（用户 2026-10-08 实测报的 bug：点了还继续重试/提交）──
+        # 根因：取消标志只在导入期等待循环里被检查，引擎的重试循环完全不看它。
+        class _RecordingEngine:
+            def __init__(self) -> None:
+                self.cancel_calls = 0
+
+            def cancel(self) -> None:
+                self.cancel_calls += 1
+
+        stop_worker = GrabWorker(self.build_plan_from_ui(apply_selection=False),
+                                 wait_until_epoch=None, client_factory=DemoClient)
+        recorder = _RecordingEngine()
+        stop_worker._engine = recorder          # 假装引擎已就绪
+        stop_worker.cancel()
+        expect("停止会透传给引擎（重试循环里才停得住）",
+               recorder.cancel_calls == 1 and stop_worker._cancel is True,
+               f"透传 {recorder.cancel_calls} 次")
+        self._on_phase("cancelled", 0.0)
+        expect("停止后阶段显示『已取消』（不是已完成）",
+               "已取消" in self.lbl_phase.text(), self.lbl_phase.text())
+        # 可取消等待：取消后**立刻**返回，而不是傻等满间隔
+        stop_runner = runner.Runner(self.build_plan_from_ui(apply_selection=False),
+                                    client=DemoClient(), log=lambda _m: None)
+        stop_runner.cancel()
+        expect("runner 暴露取消状态", stop_runner.cancelled is True)
+        started_at = time.monotonic()
+        interrupted = stop_runner._sleep_cancellable(3.0)
+        waited = time.monotonic() - started_at
+        expect("取消后『等待重试』立刻返回（不死等 3 秒）",
+               interrupted is True and waited < 1.0, f"实际等了 {waited:.2f}s")
+
         # ── 2026-10-08 用户要求的默认值与设置区 ──
         expect("默认是真实提交（不是演练）", GrabPlan().dry_run is False,
                f"GrabPlan().dry_run={GrabPlan().dry_run}")

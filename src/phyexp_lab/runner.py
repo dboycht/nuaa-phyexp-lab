@@ -75,6 +75,8 @@ class RunReport:
     started_at: dt.datetime = field(default_factory=dt.datetime.now)
     finished_at: dt.datetime | None = None
     aborted_reason: str | None = None
+    #: 用户点了「停止」而中止（**不是**失败；未完成的时段仍会如实列入 uncovered）
+    cancelled: bool = False
 
     @property
     def succeeded(self) -> list[Attempt]:
@@ -87,6 +89,8 @@ class RunReport:
     def summary_lines(self) -> list[str]:
         """给终端与通知用的摘要（**如实**：失败与未覆盖都要列出来）。"""
         lines: list[str] = []
+        if self.cancelled:
+            lines.append("已按「停止」中止：剩下的时段没有继续提交/重试。")
         if self.aborted_reason:
             lines.append(f"已中止：{self.aborted_reason}")
         if self.dry_run:
@@ -124,6 +128,9 @@ class Runner:
         self.on_progress = on_progress or log
         self._client = client
         self._owns_client = client is None
+        #: 用户点「停止」置位；**每个可中断点**都要看它
+        #: （曾经只在导入期等待里看 ⇒ 点了「停止」仍会继续重试并提交，用户实测报上来）
+        self._cancelled = False
 
     # ── 客户端 ──
 
@@ -244,6 +251,9 @@ class Runner:
                 candidates = [c for c in plan.candidates if c.free_key not in secured()]
 
             for index, candidate in enumerate(candidates, 1):
+                if self._cancelled:      # 用户点了停止：本轮**立刻**不再提交
+                    self.log("[停止] 已按你的要求中止：本条之后的候选不再提交。")
+                    return True
                 if candidate.free_key in secured():
                     report.skipped.append(f"{candidate.describe()}（该时段已被占）")
                     continue
@@ -318,25 +328,58 @@ class Runner:
         if rounds > 1 and not cfg.dry_run:
             self.log(f"[设置] 到点后最多重试 {rounds} 轮，每轮间隔 {cfg.retry_interval_seconds:.0f} 秒"
                      f"（用户确认：重试固定次数后停）")
+        rounds_run = 0
         for round_index in range(rounds):
+            if self._cancelled:
+                break
             if round_index > 0:
                 if cfg.dry_run:
                     break     # 演练只跑一轮：候选与真实一致即可，没必要重复等待
                 wait = max(0.0, float(cfg.retry_interval_seconds))
-                self.log(f"[等待] {wait:.0f} 秒后开始第 {round_index + 1} 轮重试……")
-                try:
-                    time.sleep(wait)
-                except KeyboardInterrupt:
-                    self.log("[中断] 用户取消重试。")
+                self.log(f"[等待] {wait:.0f} 秒后开始第 {round_index + 1} 轮重试……"
+                         f"（点「停止」可随时中断）")
+                if self._sleep_cancellable(wait):
+                    self.log("[停止] 等待期间收到停止请求，不再重试。")
                     break
+            rounds_run += 1          # 只有**真正跑过**的轮才计数
             if run_round(round_index):
                 break
 
         if taken_slots:
             report.notes.append(f"本次提交的场次：{', '.join(taken_slots)}")
-        report.rounds_used = round_index + 1
+        if self._cancelled:
+            report.cancelled = True
+            report.notes.append("已按「停止」中止（未提交的时段仍在未覆盖清单里）")
+        # ⚠️ 数**真正跑过的轮数**：原来用 round_index+1，会把"在等待里被取消的那一轮"也算上
+        #    （实测：等 8 秒的第 2 轮被取消，报告却写 rounds_used=2，与事实不符）
+        report.rounds_used = max(1, rounds_run)
         report.finished_at = dt.datetime.now()
         return self._finish(report)
+
+    # ── 取消 ──
+
+    def cancel(self) -> None:
+        """请求取消：到**下一个可中断点**立刻停下（不再重试、不再提交）。"""
+        self._cancelled = True
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def _sleep_cancellable(self, seconds: float) -> bool:
+        """可取消的等待：返回 True = 等待期间被取消。
+
+        ⚠️ 不能直接 `time.sleep(30)` —— 那样点了「停止」也要等满 30 秒才理你。
+        按 0.2 秒切片检查，保证"点了就停"的体感。
+        """
+        end = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            if self._cancelled:
+                return True
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            time.sleep(min(0.2, left))
 
     # ── 辅助 ──
 
