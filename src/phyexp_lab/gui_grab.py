@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QTime
 
+from . import api
 from . import config as app_config
 from . import grabconfig, planner, prompt as prompt_mod, runner, session, theme
 from .grabconfig import PERIODS, FreeSlot, GrabPlan
@@ -162,6 +163,30 @@ class GrabWorker(QThread):
                     pass
 
 
+def short_cause(message: str) -> str:
+    """把错误信息归成**一句完整的话**（给界面用；完整内容放 tooltip 与日志）。
+
+    ⚠️ 实测教训（2026-10-07）：这里原本写 `message.splitlines()[0][:60]`，
+    界面上就出现了"请重新运行 `python" 这种**半句话** —— 比不显示更糟。
+    判据：要么给完整句，要么给**归类后的完整短语**，不做字符截断。
+    """
+    text = (message or "").strip()
+    first = text.splitlines()[0] if text else ""
+    if "401" in first or "未授权" in first or "42501" in first:
+        return "登录已过期或未登录"
+    if "超时" in first or "Timeout" in first or "timed out" in first:
+        return "网络请求超时"
+    if "404" in first:
+        return "接口路径不存在（系统可能改版）"
+    if "没有开放学期" in first:
+        return "当前没有开放学期（选课窗口未开）"
+    if "没有我的课程" in first:
+        return "该学期没有你的课程"
+    if "Connection" in first or "连接" in first:
+        return "连不上服务端（检查网络或加速器）"
+    return "原因见运行日志（已记录完整错误）" if first else "未知原因"
+
+
 def format_countdown(seconds: float) -> str:
     """把剩余秒数格式化成 `HH:MM:SS`（负数/超大值都按 0 处理，不显示怪值）。
 
@@ -171,6 +196,36 @@ def format_countdown(seconds: float) -> str:
     hours, rest = divmod(total, 3600)
     minutes, secs = divmod(rest, 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def compact_login_text(token: str | None) -> str:
+    """登录态的**短**文案（状态标签用）；完整时间放 tooltip。
+
+    ⚠️ 实测教训（2026-10-07 用户反馈"文字显示不全"）：早期把
+    `session.describe_token()` 的完整串截 28 字塞进标签，显示成
+    `登录态：有效期至 2026-10-07 22:07:56（约剩` —— **半句话，比不显示更糟**。
+    正解：标签只给结论（有效 / 已过期 / 未登录 + 剩余量），细节进 tooltip。
+
+    ⚠️ **第二个教训（同日）**：这里原本写 `except Exception: return "未知"`，
+    把 `api` 未导入导致的 `NameError` **静默降级成"未知"** —— 界面看着"只是没读到"，
+    实际是代码 bug。现在：异常类型**必须显示出来**（`无法解析（NameError）`），
+    不许把"我方出错"伪装成"没数据"。
+    """
+    if not token:
+        return "登录态：未登录"
+    try:
+        claims = api.decode_token_claims(token)
+    except Exception as exc:  # noqa: BLE001 - 但**必须**把异常类型暴露到界面上
+        return f"登录态：无法解析（{type(exc).__name__}）"
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)):
+        return "登录态：有效（无 exp）"
+    remaining = float(exp) - dt.datetime.now().timestamp()
+    if remaining <= 0:
+        return "登录态：已过期（点右侧登录）"
+    if remaining < 3600:
+        return f"登录态：有效（剩 {int(remaining // 60)} 分）"
+    return f"登录态：有效（剩 {remaining / 3600:.1f} 小时）"
 
 
 # ── 面板 ──
@@ -359,11 +414,18 @@ class GrabPanel(QDialog):
         grid_outer.setContentsMargins(10, 8, 10, 10)
         hint = QLabel(theme.muted(
             "点格子 = 标记「这个时段我有空」（与当前有没有课无关）；"
-            "格子里的小字是**当前可见情况**，窗口未开时大多显示「未放出」属正常。"
-            "到点开抢时会**重新拉取实时列表**再筛候选。"))
+            "格子里的小字是当前可见情况，窗口未开时大多显示「未放出」属正常。"
+            "到点开抢时会重新拉取实时列表再筛候选。"))
         hint.setWordWrap(True)
         hint.setObjectName("step")
         grid_outer.addWidget(hint)
+        # 拉取失败/无数据时的**显式横幅**（用户 2026-10-07 提醒：拉不到时"没有数据也不会显示"，
+        # 那就必须说清楚为什么空，而不是留一片白让人以为坏了）
+        self.banner = QLabel("")
+        self.banner.setWordWrap(True)
+        self.banner.setObjectName("chipWarn")
+        self.banner.setVisible(False)
+        grid_outer.addWidget(self.banner)
         self.grid_host = QWidget()
         self.grid = QGridLayout(self.grid_host)
         self.grid.setSpacing(4)
@@ -473,6 +535,19 @@ class GrabPanel(QDialog):
         self._loader.finished.connect(lambda: self.btn_reload.setEnabled(True))
         self._loader.start()
 
+    def _show_banner(self, text: str, tooltip: str = "") -> None:
+        """在网格卡里显示一条醒目的说明（拉取失败/无数据时用，避免一片空白让人以为坏了）。
+
+        `text` 是**给人看的一句话**（不许截半句、不许带 markdown 标记）；
+        完整错误走 `tooltip`（鼠标悬停可见），日志里也另有一份。
+        """
+        self.banner.setText(text)
+        self.banner.setToolTip(tooltip or text)
+        self.banner.setVisible(True)
+
+    def _hide_banner(self) -> None:
+        self.banner.setVisible(False)
+
     def _set_chip(self, chip: QLabel, text: str, kind: str = "chip") -> None:
         """更新状态小标签（颜色跟着状态走，不用肉眼看文字判断）。"""
         chip.setText(text)
@@ -574,7 +649,8 @@ class GrabPanel(QDialog):
         if token and "已过期" not in described:
             self._login_timer.stop()
             self.btn_login.setEnabled(True)
-            self._set_chip(self.chip_login, f"登录态：{described[:28]}", "chipOk")
+            self._set_chip(self.chip_login, compact_login_text(token), "chipOk")
+            self.chip_login.setToolTip(described)
             self.log_line(f"[登录] 已登录：{described}")
             self.reload()
             return
@@ -594,6 +670,11 @@ class GrabPanel(QDialog):
         self._set_chip(self.chip_login, "登录态：不可用", "chipDanger")
         self.log_line(f"[加载失败] {message}")
         self.log_line("       界面保持空白（不伪造数据）；请确认已 login 且选课窗口已开。")
+        cause = short_cause(message)
+        self._show_banner(
+            f"当前拉取不到场次（{cause}）。"
+            "这不影响你设置空闲时段：照常点格子即可，到点开抢时会重新拉取实时列表。"
+            "如果是登录过期，请点右上角「登录」。", tooltip=message)
 
     def _on_loaded(self, payload: dict) -> None:
         self.cells = payload["cells"]
@@ -605,11 +686,14 @@ class GrabPanel(QDialog):
         # 顶部状态标签：登录态 / 课程 / 窗口
         try:
             token = session.load_token()
-            remain = session.describe_token(token) if token else "无 token"
+            full = session.describe_token(token) if token else "无 token"
         except Exception:  # noqa: BLE001 - 状态展示失败不该影响功能
-            remain = "未知"
-        self._set_chip(self.chip_login, f"登录态：{remain[:28]}",
-                       "chipOk" if "已过期" not in remain else "chipDanger")
+            token, full = None, "未知"
+        short = compact_login_text(token)
+        self._set_chip(self.chip_login, short,
+                       "chipOk" if "有效" in short else
+                       ("chipWarn" if "未登录" in short else "chipDanger"))
+        self.chip_login.setToolTip(full)      # 完整时间放提示里，标签不再被截成半句
         course_name = ""
         for course in payload.get("courses") or []:
             if str(course.get("id")) == str(payload["course_id"]):
@@ -620,8 +704,13 @@ class GrabPanel(QDialog):
         self.log_line(f"已加载：课程 id={payload['course_id']}，当前可见可约单元 {avail} 个，"
                       f"已有选课 {taken} 个，已选过实验 {len(payload['taken'])} 个")
         if avail == 0:
-            self.log_line("       注意：现在看不到可约单元，**这在窗口未开时是正常的** ——"
+            self.log_line("       注意：现在看不到可约单元，这在窗口未开时是正常的 ——"
                           "你照常点选空闲时段即可，到点后系统会按当时的实时余量重新筛候选。")
+            self._show_banner(
+                "当前没有已放出的场次（选课窗口未开 / 已满 / 都选过了）—— 这属正常。"
+                "你照常点选空闲时段即可；到点开抢时系统会重新拉取实时列表再筛候选。")
+        else:
+            self._hide_banner()
         # ⚠️ **不要**因为"当前不可见/已满"就把用户已选的空闲时段剔掉 —— 那等于把用户的设置丢了。
         #    选的是"我什么时候有空"，与"现在有什么课"是两件事（用户 2026-10-07 的纠正）。
         dropped = 0
@@ -665,6 +754,11 @@ class GrabPanel(QDialog):
             self.grid.addWidget(label, 0, columns[start], 1, end - start + 1)
             del week_index
 
+        # 让日期列**均分可用宽度**（窄窗口时自动变窄，而不是溢出到横向滚动）
+        for col in columns:
+            self.grid.setColumnStretch(col, 1)
+        self.grid.setColumnStretch(week_gap_col, 0)
+
         separator = QFrame()
         separator.setFrameShape(QFrame.VLine)
         separator.setStyleSheet(f"background: {theme.ACTIVE.border_strong};")
@@ -698,7 +792,7 @@ class GrabPanel(QDialog):
                 button.setCursor(Qt.PointingHandCursor)
                 button.setToolTip(self._button_tip(key, info, selected=selected))
                 button.setMinimumHeight(36)      # 36px：5 个节次在默认窗口里能一次看全（40px 会差 31px，需滚动）
-                button.setMinimumWidth(62)
+                button.setMinimumWidth(48)
                 state = "selected" if selected else self._cell_state(info)
                 button.setStyleSheet(theme.cell_qss(state))
                 button.clicked.connect(lambda _checked=False, k=key: self.toggle_cell(k))
@@ -739,13 +833,13 @@ class GrabPanel(QDialog):
                          f"\n实验：{info.get('project_name')}\n场次 id：{info.get('best_slot_id')}",
             "full": "当前已满",
             "taken": f"你在这个时段已有选课（{info.get('reason') or ''}）",
-            "all_elected": ("该节次只放了你**已选过**的实验 —— 同一实验不重复选，所以这里没有可抢的新实验。\n"
+            "all_elected": ("该节次只放了你已选过的实验 —— 同一实验不重复选，所以这里没有可抢的新实验。\n"
                             + "涉及：" + "、".join(info.get("blocked_projects") or ["（未取到名称）"])),
-            "none": "当前看不到这个节次的场次（窗口未开/未排课 —— **属正常**）",
+            "none": "当前看不到这个节次的场次（窗口未开/未排课 —— 属正常）",
         }.get(state, state)
         return (f"{head}当前可见情况：{current}\n\n"
                 "点一下即可把它设为/取消『我的空闲时段』；\n"
-                "真正的候选会在**到点执行时**按当时的实时余量重新筛选。")
+                "真正的候选会在到点执行时按当时的实时余量重新筛选。")
 
     # ── 点选 ──
 
@@ -843,7 +937,7 @@ class GrabPanel(QDialog):
             return
         if not plan.dry_run:
             if not self._ask("确认真实提交",
-                             f"即将**真实提交** {len(plan.free_slots)} 个空闲时段的选课，会写进你的课表。\n"
+                             f"即将真实提交 {len(plan.free_slots)} 个空闲时段的选课，会写进你的课表。\n"
                              f"重试轮数 {plan.retry_rounds}，每轮间隔 {plan.retry_interval_seconds:.0f} 秒。\n\n确认继续？"):
                 self.log_line("[已取消] 未开始。")
                 return
@@ -1077,6 +1171,95 @@ class GrabPanel(QDialog):
         avail_h = (self.screen() or QApplication.primaryScreen()).availableGeometry().height()
         expect("窗口最小高度能缩进可用工作区", self.minimumSizeHint().height() < avail_h - 40,
                f"最小 {self.minimumSizeHint().height()} vs 工作区 {avail_h}")
+
+        # ── 用户反馈（2026-10-07）：文字显示不全 / 控件宽度不够 ──
+        # ① 登录态标签必须是**结论**，不能是半句话（早期 [:28] 截出"…（约剩"这种）
+        chip_text = self.chip_login.text()
+        expect("登录态标签不是被截断的半句话",
+               not chip_text.endswith("（") and "约剩" not in chip_text and len(chip_text) <= 26,
+               f"标签={chip_text!r}")
+        # 用一枚**语法合法的假 JWT**验证解析路径本身没坏（不需要真实账号/网络）——
+        # 这条门禁本来能抓住"api 未导入 ⇒ NameError 被吞成未知"那个 bug。
+        import base64 as _b64
+        import json as _json
+        def _b64u(obj):
+            return _b64.urlsafe_b64encode(_json.dumps(obj).encode()).decode().rstrip("=")
+        fake_jwt = "Bearer " + ".".join([
+            _b64u({"alg": "HS256", "typ": "JWT"}),
+            _b64u({"user_id": 0, "exp": dt.datetime.now().timestamp() + 3600}),
+            "sig",
+        ])
+        parsed = compact_login_text(fake_jwt)
+        expect("登录态解析不因内部错误降级", "无法解析" not in parsed and "有效" in parsed, parsed)
+        expect("登录态：无 token 时提示未登录", compact_login_text(None) == "登录态：未登录",
+               compact_login_text(None))
+        expect("登录态标签有明确结论",
+               any(word in chip_text for word in ("有效", "已过期", "未登录", "无法解析")), chip_text)
+
+        # ② 在**最小窗口宽度**下，网格不该需要横向滚动（两周 14 天都要看得见）
+        self.resize(self.minimumSizeHint().width(), self.height())
+        for _ in range(3):
+            QApplication.processEvents()
+        self.layout().activate()
+        need_w = self.grid_host.sizeHint().width()
+        have_w = scroll.viewport().width()
+        expect("最小宽度下网格无需横向滚动（14 天可见）", need_w <= have_w + 1,
+               f"内容宽 {need_w}px > 视口宽 {have_w}px")
+
+        # ③ 通用门禁：**没有文字被截断**的标签（按字体实际测量，不靠肉眼）
+        #    ⚠️ 多行标签要按**最长的一行**量，不能把各行拼起来量 ——
+        #    实测踩到：日期表头是两行（`10-07` + `周三`），拼起来量成 57px 会误报"截断"。
+        import re as _re
+
+        clipped: list[str] = []
+        for label in self.findChildren(QLabel):
+            if not label.isVisible() or label.wordWrap() or label.width() <= 1:
+                continue
+            text = label.text()
+            text = _re.sub(r"<br\s*/?>", "\n", text, flags=_re.IGNORECASE)
+            text = _re.sub(r"<[^>]+>", "", text)
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if not lines:
+                continue
+            metrics = label.fontMetrics()
+            needed = max(metrics.horizontalAdvance(line) for line in lines)
+            if needed > label.width() + 1:             # 严格大于才算截断（避免"刚好相等"误报）
+                clipped.append(f"{lines[0][:16]}({needed}>{label.width()})")
+        expect("界面上没有文字被截断的标签", not clipped, str(clipped[:4]))
+
+        # ④ 拉不到数据时必须有**显式横幅**（用户 2026-10-07 提醒：拉不到时也不会显示）
+        self._show_banner("测试：当前拉取不到场次")
+        expect("无数据时横幅可见", self.banner.isVisible() and self.banner.text())
+        before_h = self.banner.height()
+        self._hide_banner()
+        expect("有数据时横幅隐藏", not self.banner.isVisible())
+        expect("横幅高度合理（非零、不超两行）", before_h > 0, f"高度 {before_h}")
+
+        # ⑤ 界面文本**不许出现 markdown 标记**（memory/16 的规矩；这次又犯了，故做成运行时门禁）
+        #    按"真实可见的文本"查：标签文字 / 悬停提示 / 横幅 / 结果区；
+        #    运行日志只查 `**`（api 层的错误文案里合法带反引号，属半技术性文本）。
+        markdown_hits: list[str] = []
+        for label in self.findChildren(QLabel):
+            if not label.isVisible():
+                continue
+            for text in (label.text(), label.toolTip()):
+                if "**" in text or "`" in text:
+                    markdown_hits.append(f"标签:{text[:26]}")
+        for name, blob in (("横幅", self.banner.text()),
+                           ("结果区", self.result_text.toPlainText())):
+            if "**" in blob or "`" in blob:
+                markdown_hits.append(f"{name}:{blob[:26]}")
+        if "**" in self.log.toPlainText():
+            markdown_hits.append("运行日志含 **")
+        expect("界面文本不含 markdown 标记", not markdown_hits, str(markdown_hits[:4]))
+
+        # ⑥ 错误文案必须是**完整的一句话**（不许截成半句，如"请重新运行 `python"）
+        cause_401 = short_cause("ApiError: 401 未授权（PostgREST 42501）：token 可能已过期")
+        expect("错误归类给完整短句", cause_401.endswith("未登录"), cause_401)
+        cause_unknown = short_cause("某些奇怪的长错误" + "x" * 200)
+        expect("错误归类不截断（未知原因也给整句）",
+               cause_unknown == "原因见运行日志（已记录完整错误）" or cause_unknown.endswith("）"),
+               cause_unknown)
         self.hide()
 
         self.log_line("")

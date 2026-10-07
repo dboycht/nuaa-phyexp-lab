@@ -269,7 +269,7 @@ def _cmd_grab(args: argparse.Namespace) -> int:
         client.close()
 
     print()
-    print("[演练汇总]（dry-run 的结果**不是**成功，只说明定时链路走通了）" if not args.real
+    print("[演练汇总]（dry-run 的结果不是成功，只说明定时链路走通了）" if not args.real
           else "[发射汇总]（真实提交）")
     for attempt in engine.attempts:
         deviation = "-" if attempt.deviation_ms is None else f"{attempt.deviation_ms:+.1f}ms"
@@ -491,7 +491,7 @@ def _cmd_snapshot(args: argparse.Namespace) -> int:
     print(f"合计：实验项目 {total_projects} 个，场次 {total_slots} 条，其中有余额 {total_free} 条")
     print(f"快照已保存 → {out}")
     if total_slots == 0:
-        print("[说明] 场次为 0 是**如实结果**：可能该学期尚未放课/已结束，或该项目的排课未发布。")
+        print("[说明] 场次为 0 是如实结果：可能该学期尚未放课/已结束，或该项目的排课未发布。")
     return 0
 
 
@@ -692,7 +692,7 @@ def _cmd_elect(args: argparse.Namespace) -> int:
                         rows.append((experiment, slot))
                 free = [(e, s) for e, s in rows if (s.remaining or 0) > 0]
                 total_free += len(free)
-                print(f"  该项目共 {len(rows)} 个场次，其中**有余量 {len(free)} 个**：")
+                print(f"  该项目共 {len(rows)} 个场次，其中有余量 {len(free)} 个：")
                 for experiment, slot in free:
                     flag = "✅已选" if slot.slot_id in mine_slots else "  "
                     print(f"    {flag} slot={slot.slot_id:>7}  {slot.time_text:24s} "
@@ -725,9 +725,9 @@ def _cmd_elect(args: argparse.Namespace) -> int:
         print(f"[结果] {result.describe()}")
         if result.body_text:
             print(f"       服务端原始响应：{result.body_text[:200]}")
-            print("       ⚠️ 注意：本系统**成功时也返回 status:false**"
+            print("       ⚠️ 注意：本系统成功时也返回 status:false"
                   "（实测 `HTTP 200 {\"status\":false,\"code\":200,\"message\":\"ok\"}`）"
-                  "⇒ 判据只看 HTTP 状态码与 message 文案，**不要**用 status 字段。")
+                  "⇒ 判据只看 HTTP 状态码与 message 文案，不要用 status 字段。")
 
         # ── 服务端核实（不拿 HTTP 200 当成功）──
         print("[核实] 回读我的选课记录……")
@@ -736,7 +736,7 @@ def _cmd_elect(args: argparse.Namespace) -> int:
             hit = [m for m in mine if str(m.get("schedule_id")) == slot_id]
             if hit:
                 record = hit[0]
-                print(f"  ✅ 服务端**确实**有这条选课记录：user2project_id={record.get('id')} "
+                print(f"  ✅ 服务端确实有这条选课记录：user2project_id={record.get('id')} "
                       f"status={record.get('schedule_status')}")
                 print(f"     退课命令：python run.py cancel --id {record.get('id')}")
             else:
@@ -750,7 +750,7 @@ def _cmd_elect(args: argparse.Namespace) -> int:
             print(f"  [警告] 核实失败（不影响提交本身）：{exc}")
 
         if not result.ok:
-            print("[结论] 本次选课**未成功**；服务端文案见上，写操作日志在 "
+            print("[结论] 本次选课未成功；服务端文案见上，写操作日志在 "
                   f"{config.logs_dir()}\\write-*.jsonl")
             return 1
         print("[结论] 本次选课成功。")
@@ -824,7 +824,7 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
         if result.ok:
             print("[结论] 退课成功。建议用 `python run.py mine` 复核一次。")
             return 0
-        print(f"[结论] 退课**未成功**；日志：{config.logs_dir()}\\write-*.jsonl")
+        print(f"[结论] 退课未成功；日志：{config.logs_dir()}\\write-*.jsonl")
         return 1
     finally:
         client.close()
@@ -1145,7 +1145,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("stop", help="让正在运行的 login/recon 优雅收尾（保存 HAR 后退出）")
     p_gui = sub.add_parser("gui", help="图形界面：默认只读工作台；--grab 打开抢课面板")
     p_gui.add_argument("--grab", action="store_true",
-                       help="打开**抢课面板**（两周网格点选空闲时段 → 到点抢 → 结果可退课）")
+                       help="打开抢课面板（两周网格点选空闲时段 → 到点抢 → 结果可退课）")
     p_gui.add_argument("--self-check", action="store_true",
                        help="抢课面板的脚本化自检（用假客户端，不发网络请求、不碰账号）")
 
@@ -1189,7 +1189,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_autograb.add_argument("--at", default=None,
                             help="服务端墙上时刻 HH:MM:SS（今天/已过则明天）：到点自动开抢")
     p_autograb.add_argument("--plan-only", action="store_true", help="只看计划（只读，不提交）")
-    p_autograb.add_argument("--real", action="store_true", help="真实提交（**会写进课表**；默认演练）")
+    p_autograb.add_argument("--real", action="store_true", help="真实提交（会写进课表；默认演练）")
     p_autograb.add_argument("--dry-run", action="store_true", help="显式演练（默认就是演练）")
     p_autograb.add_argument("--no-notify", action="store_true", help="不发桌面通知")
     p_autograb.add_argument("--no-prompt", action="store_true",
@@ -1203,7 +1203,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="排序策略（默认 remaining_desc）")
     p_agc.add_argument("--max-total", type=int, default=None, help="上限（0 = 不设）")
     p_agc.add_argument("--at", default=None, help="默认目标时刻 HH:MM:SS（可选）")
-    p_agc.add_argument("--real", action="store_true", help="把 dry_run 设为 false（**谨慎**）")
+    p_agc.add_argument("--real", action="store_true", help="把 dry_run 设为 false（谨慎）")
     p_agc.add_argument("--no-notify", action="store_true", help="关闭桌面通知")
     p_agc.add_argument("--example", action="store_true", help="只打印示例配置（不写文件）")
 
@@ -1213,7 +1213,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_grab.add_argument("--in", dest="in_seconds", type=float, default=None,
                         help="从现在起多少秒后发射（演练方便；与 --at 二选一）")
     p_grab.add_argument("--real", action="store_true",
-                        help="**真实提交**（写操作，会真的写进你的课表；载荷已于 2026-10-07 实测确认）")
+                        help="真实提交（写操作，会真的写进你的课表；载荷已于 2026-10-07 实测确认）")
     p_grab.add_argument("--course", default=None,
                         help="课程 id（--real 时必需：写接口要 lesson_id + course_id 两个字段）")
     p_grab.add_argument("--pre-fire", type=int, default=50, help="预发射提前毫秒数（默认 50）")
@@ -1251,7 +1251,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_snapshot = sub.add_parser("snapshot", help="只读采集课程/实验项目/场次余量并落盘")
     p_snapshot.add_argument("--timeout", type=float, default=20.0, help="单次请求超时秒数（默认 20）")
     p_snapshot.add_argument("--all-status", action="store_true",
-                            help="取该项目**全部已发布**场次（研究余量用）；不加则只取「我已选/已排」的场次（与前端首页一致）")
+                            help="取该项目全部已发布场次（研究余量用）；不加则只取「我已选/已排」的场次（与前端首页一致）")
 
     p_watch = sub.add_parser("watch", help="余量监控：低频轮询关注场次的剩余名额（只读）")
     p_watch.add_argument("--course", default=None, help="课程 id（默认取我该学期第一门课）")

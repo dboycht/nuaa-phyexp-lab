@@ -91,7 +91,7 @@ class RunReport:
             lines.append(f"已中止：{self.aborted_reason}")
         if self.dry_run:
             # 演练必须说"本应提交"，不能说"成功 0 个" —— 后者会被读成"全失败了"
-            lines.append(f"演练模式（**未发任何写请求**）：本应提交 {len(self.would_submit)} 个，"
+            lines.append(f"演练模式（未发任何写请求）：本应提交 {len(self.would_submit)} 个，"
                          f"候选共 {len(self.planned)} 个")
             for item in self.would_submit:
                 lines.append(f"  → {item.date} {item.period} [{item.project_name[:18]}] slot={item.slot_id}")
@@ -273,7 +273,7 @@ class Runner:
                     attempt.ok = False
                     attempt.outcome = "unverified"
                     attempt.message = f"HTTP 200 但回读未确认（{detail}）"
-                    self.log(f"       └ ⚠️ 回读未确认：{detail} —— 按**未成功**记录")
+                    self.log(f"       └ ⚠️ 回读未确认：{detail} —— 按未成功记录")
                 report.attempts.append(attempt)
 
                 # 每条之间保持最小间隔（合规：低频，沿用实测校准值）
