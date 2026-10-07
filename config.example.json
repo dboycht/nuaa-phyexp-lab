@@ -1,0 +1,25 @@
+{
+  "course_id": null,
+  "free_slots": [
+    {
+      "date": "2026-10-14",
+      "period": "下午5、6节"
+    },
+    {
+      "date": "2026-10-15",
+      "period": "晚上9，10节"
+    }
+  ],
+  "priority": "remaining_desc",
+  "max_total": 0,
+  "skip_taken_projects": true,
+  "dry_run": true,
+  "notify": true,
+  "target_at": null,
+  "submit": {
+    "prewarm": true,
+    "pre_fire_offset_ms": 50,
+    "min_submit_interval_ms": 800,
+    "max_attempts_per_target": 3
+  }
+}

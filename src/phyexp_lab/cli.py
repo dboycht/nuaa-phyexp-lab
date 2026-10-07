@@ -20,6 +20,7 @@ import argparse
 import datetime as dt
 import json
 import sys
+import time
 from pathlib import Path
 
 from . import __version__, config, probe, scrub, session
@@ -821,6 +822,250 @@ def _cmd_cancel(args: argparse.Namespace) -> int:
         client.close()
 
 
+# ── 自动抢课（1.0.3：按空闲时段尽量多选）──
+
+
+def _parse_free_slot_args(raw: str) -> list:
+    """把 `--free "2026-10-14 下午5、6节,2026-10-15 晚上9，10节"` 解析成 FreeSlot 列表。
+
+    格式：`日期<空格>节次`，多项用英文逗号分隔；节次名支持常见等价写法（见 grabconfig）。
+    """
+    from . import grabconfig
+
+    slots = []
+    for chunk in str(raw or "").split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        parts = item.split(None, 1)
+        if len(parts) != 2:
+            print(f"[错误] --free 的每一项要写成「日期 节次」，实际是 {item!r}", file=sys.stderr)
+            print(f"       合法节次：{' / '.join(grabconfig.PERIODS)}", file=sys.stderr)
+            return []
+        date, period = parts[0].strip(), parts[1].strip()
+        try:
+            slots.append(grabconfig.FreeSlot(date=date, period=period))
+        except grabconfig.ConfigError as exc:
+            print(f"[错误] {exc}", file=sys.stderr)
+            return []
+    return slots
+
+
+def _cmd_autograb_config(args: argparse.Namespace) -> int:
+    """写抢课配置：真实配置进运行时目录；`--example` 只打印示例。"""
+    from . import grabconfig
+
+    if args.example:
+        example = grabconfig.example_path()
+        if example.is_file():
+            print(example.read_text(encoding="utf-8"))
+        else:
+            print(json.dumps(grabconfig.GrabPlan().to_dict(), ensure_ascii=False, indent=2))
+        return 0
+
+    plan = grabconfig.GrabPlan()
+    if args.course is not None:
+        plan.course_id = args.course
+    if args.free:
+        slots = _parse_free_slot_args(args.free)
+        if not slots:
+            return 2
+        plan.free_slots = slots
+    if args.priority:
+        plan.priority = args.priority
+    if args.max_total is not None:
+        plan.max_total = args.max_total
+    if args.real:
+        plan.dry_run = False
+    if args.no_notify:
+        plan.notify = False
+    if args.at:
+        plan.target_at = args.at
+
+    if not plan.free_slots:
+        print("[提示] 还没给空闲时段：请加 --free，例如：")
+        print('       python run.py autograb-config --course 71 '
+              '--free "2026-10-14 下午5、6节,2026-10-15 晚上9，10节"')
+        path = grabconfig.write_config(plan)
+        print(f"[完成] 已写入默认配置（尚未含空闲时段）→ {path}")
+        return 0
+
+    try:
+        plan.validate()
+    except grabconfig.ConfigError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+    path = grabconfig.write_config(plan)
+    print(f"[完成] 配置已写入 → {path}")
+    print(f"       课程 id：{plan.course_id if plan.course_id is not None else '（取我的第一门课）'}")
+    print(f"       空闲时段 {len(plan.free_slots)} 个：" +
+          "；".join(s.describe() for s in plan.free_slots))
+    print(f"       优先级：{plan.priority}（余量多的先抢）；上限："
+          f"{'不设' if not plan.max_total else plan.max_total}")
+    print(f"       提交模式：{'演练（dry_run=true，不会真提交）' if plan.dry_run else '真实提交（dry_run=false）'}"
+          f"；桌面通知：{'开' if plan.notify else '关'}")
+    if plan.dry_run:
+        print("       ⚠️ 现在仍是演练模式；确认计划无误后加 --real 才会真实提交。")
+    return 0
+
+
+def _cmd_autograb(args: argparse.Namespace) -> int:
+    """自动抢课：计划 → （可选）等到点 → 按空闲时段尽量多选 → 回读核实 → 通知。"""
+    from . import grabconfig, notify as notify_mod, planner, runner
+
+    # 1) 配置
+    try:
+        plan_cfg = (grabconfig.GrabPlan.from_dict(json.loads(Path(args.config).read_text(encoding="utf-8")))
+                    if args.config else grabconfig.load_config())
+    except grabconfig.ConfigError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(f"[错误] 读取配置失败（{type(exc).__name__}）：{exc}", file=sys.stderr)
+        return 2
+
+    if args.free:
+        slots = _parse_free_slot_args(args.free)
+        if not slots:
+            return 2
+        plan_cfg.free_slots = slots
+    if args.course is not None:
+        plan_cfg.course_id = args.course
+    if args.priority:
+        plan_cfg.priority = args.priority
+    if args.max_total is not None:
+        plan_cfg.max_total = args.max_total
+    if args.real:
+        plan_cfg.dry_run = False
+    if args.dry_run:
+        plan_cfg.dry_run = True
+    if args.no_notify:
+        plan_cfg.notify = False
+
+    try:
+        plan_cfg.validate()
+    except grabconfig.ConfigError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+
+    mode = "演练（不会真提交）" if plan_cfg.dry_run else "真实提交（会写进你的课表）"
+    print(f"[抢课] 模式：{mode}；课程 id：{plan_cfg.course_id if plan_cfg.course_id is not None else '（我的第一门课）'}")
+
+    log_lines: list[str] = []
+
+    def log(msg: str) -> None:
+        log_lines.append(msg)
+        print(msg, flush=True)
+
+    engine = runner.Runner(plan_cfg, log=log)
+    try:
+        # 2) 只出计划
+        if args.plan_only:
+            client = engine._client_or_create()          # noqa: SLF001 - 内部装配，CLI 只读用
+            plan, _semester, _course = planner.fetch_plan(client, plan_cfg)
+            print()
+            for line in planner.render_plan(plan, plan_cfg):
+                print(line)
+            print()
+            print("[plan-only] 只读规划，未提交任何请求。")
+            return 0
+
+        # 3) 到点自动开抢（服务端时刻为准）
+        if args.at:
+            from . import probe
+
+            target_epoch = _target_server_epoch(args.at)
+            print(f"[等待] 目标（服务端时钟）{args.at}；本地对应 "
+                  f"{dt.datetime.fromtimestamp(target_epoch).astimezone().isoformat(timespec='seconds')}")
+            wait_seconds = target_epoch - dt.datetime.now().timestamp()
+            if wait_seconds <= 0:
+                print("[警告] 目标时刻已过，立即执行。")
+            else:
+                print(f"[等待] 还需 {wait_seconds / 60:.1f} 分钟；等待期间会定期检查登录态。")
+                if not _wait_until(target_epoch, plan_cfg, log):
+                    return 130
+
+        # 4) 执行
+        report = engine.run()
+    except Exception as exc:  # noqa: BLE001 - 顶层兜底：任何异常都要发通知，不能静默死掉
+        message = f"抢课流程异常终止（{type(exc).__name__}）：{exc}"
+        print(f"[错误] {message}", file=sys.stderr)
+        if plan_cfg.notify:
+            notify_mod.notify("抢课异常终止", message[:180], log=log)
+        return 1
+    finally:
+        engine.close()
+
+    # 5) 结果
+    print()
+    print("=== 结果 ===")
+    for line in report.summary_lines():
+        print(line)
+    log_path = config.logs_dir() / f"autograb-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        print()
+        print(f"完整日志 → {log_path}")
+    except OSError as exc:
+        print(f"[警告] 日志落盘失败：{exc}", file=sys.stderr)
+
+    if report.aborted_reason:
+        return 3
+    if plan_cfg.dry_run:
+        return 0
+    return 0 if report.succeeded else 1
+
+
+def _target_server_epoch(at: str) -> float:
+    """把"服务端墙上时刻 HH:MM:SS（今天）"换算成本地 epoch（**对时后再算**）。"""
+    from . import probe
+
+    try:
+        offset = probe.measure_clock_offset(samples=5).offset_seconds
+    except Exception as exc:  # noqa: BLE001 - 对时失败就用本地钟，但必须说清楚
+        print(f"[警告] 对时失败（{type(exc).__name__}：{exc}）⇒ 按本地时钟打点（可能有秒级误差）")
+        offset = 0.0
+    now_local = dt.datetime.now().astimezone()
+    hour, minute, second = (int(x) for x in str(at).split(":"))
+    wall = now_local.replace(hour=hour, minute=minute, second=second, microsecond=0)
+    if wall.timestamp() < now_local.timestamp() - 60:
+        wall = wall + dt.timedelta(days=1)     # 已过则该时刻指"明天"
+    return wall.timestamp() - offset
+
+
+def _wait_until(target_epoch: float, plan_cfg, log) -> bool:
+    """等到目标时刻；期间定期检查登录态。返回 False = 被中断/登录态失效。"""
+    from . import grabconfig, runner
+
+    checked = 0.0
+    while True:
+        remain = target_epoch - dt.datetime.now().timestamp()
+        if remain <= 0.05:
+            break
+        try:
+            time.sleep(min(remain, 30.0))
+        except KeyboardInterrupt:
+            log("[中断] 用户取消等待。")
+            return False
+        # 每约 10 分钟检查一次 token（JWT 实测 2 小时过期，长时间等待必须先发现失效）
+        if dt.datetime.now().timestamp() - checked > 600:
+            checked = dt.datetime.now().timestamp()
+            try:
+                from . import api as api_mod
+
+                client = api_mod.PhyExpClient(timeout=10.0)
+                try:
+                    left = runner.Runner(plan_cfg).token_seconds_left(client)
+                    log(f"[检查] 距离目标还有 {remain / 60:.1f} 分钟；"
+                        f"登录态剩余 {'未知' if left is None else f'{int(left)} 秒'}")
+                finally:
+                    client.close()
+            except Exception as exc:  # noqa: BLE001 - 检查失败不打断等待
+                log(f"[检查] 登录态检查失败（{type(exc).__name__}）：{exc}")
+    return True
+
+
 # ── 解析器 ──
 
 
@@ -863,6 +1108,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_cancel.add_argument("--id", required=True, help="选课记录 id（rest/user2projects.id，见 `mine`）")
     p_cancel.add_argument("--dry-run", action="store_true", help="演练：只打印要做的事，不发写请求")
     p_cancel.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10）")
+
+    p_autograb = sub.add_parser(
+        "autograb",
+        help="自动抢课：按你勾选的空闲时段（具体日期+节次）尽量多选，并回读核实 + 桌面通知")
+    p_autograb.add_argument("--config", default=None, help="配置文件路径（默认取运行时目录的 config.json）")
+    p_autograb.add_argument("--free", default=None,
+                            help='临时指定空闲时段："2026-10-14 下午5、6节,2026-10-15 晚上9，10节"')
+    p_autograb.add_argument("--course", default=None, help="课程 id（默认取我的第一门课）")
+    p_autograb.add_argument("--priority", default=None,
+                            choices=["remaining_desc", "date_asc"],
+                            help="排序：remaining_desc=余量多的先抢（默认）；date_asc=日期早的先抢")
+    p_autograb.add_argument("--max-total", type=int, default=None, help="本轮最多选几个（默认 0 = 不设上限）")
+    p_autograb.add_argument("--at", default=None,
+                            help="服务端墙上时刻 HH:MM:SS（今天/已过则明天）：到点自动开抢")
+    p_autograb.add_argument("--plan-only", action="store_true", help="只看计划（只读，不提交）")
+    p_autograb.add_argument("--real", action="store_true", help="真实提交（**会写进课表**；默认演练）")
+    p_autograb.add_argument("--dry-run", action="store_true", help="显式演练（默认就是演练）")
+    p_autograb.add_argument("--no-notify", action="store_true", help="不发桌面通知")
+
+    p_agc = sub.add_parser("autograb-config", help="写/查看抢课配置（真实配置进运行时目录）")
+    p_agc.add_argument("--free", default=None,
+                       help='空闲时段："2026-10-14 下午5、6节,2026-10-15 晚上9，10节"')
+    p_agc.add_argument("--course", default=None, help="课程 id（默认取我的第一门课）")
+    p_agc.add_argument("--priority", default=None, choices=["remaining_desc", "date_asc"],
+                       help="排序策略（默认 remaining_desc）")
+    p_agc.add_argument("--max-total", type=int, default=None, help="上限（0 = 不设）")
+    p_agc.add_argument("--at", default=None, help="默认目标时刻 HH:MM:SS（可选）")
+    p_agc.add_argument("--real", action="store_true", help="把 dry_run 设为 false（**谨慎**）")
+    p_agc.add_argument("--no-notify", action="store_true", help="关闭桌面通知")
+    p_agc.add_argument("--example", action="store_true", help="只打印示例配置（不写文件）")
 
     p_grab = sub.add_parser("grab", help="抢课引擎：对时 + 预热 + 精确定时 + 预发射（默认演练，--real 才真发）")
     p_grab.add_argument("--slot", required=True, help="目标场次 id（可逗号分隔多个）")
@@ -951,6 +1226,8 @@ def main(argv: list[str] | None = None) -> int:
         "elect": _cmd_elect,
         "mine": _cmd_mine,
         "cancel": _cmd_cancel,
+        "autograb": _cmd_autograb,
+        "autograb-config": _cmd_autograb_config,
         "stop": _cmd_stop,
         "logout": _cmd_logout,
     }

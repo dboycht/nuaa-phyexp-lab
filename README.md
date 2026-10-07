@@ -53,8 +53,13 @@ python run.py elect --list         # 选课：只读列出各课程「有余量�
 python run.py elect --course 71 --slot 4971   # **选课**（写操作；加 --dry-run 只演练）
 python run.py mine                 # 我的选课记录（含退课用的 user2project_id）
 python run.py cancel --id <user2project_id>   # **退课**（写操作；加 --dry-run 只演练）
-python run.py grab --course 71 --slot <id> --in 20   # 抢课引擎演练（dry-run：只定时，不发写请求）
-python run.py grab --course 71 --slot <id> --at 12:30:00 --real   # 抢课：到点真实提交（写操作）
+python run.py autograb-config --course 71 --free "2026-10-14 下午5、6节,2026-10-15 晚上9，10节"
+                                   # 配置「空闲时段」，存到运行时目录（不进仓库）
+python run.py autograb --plan-only # 自动抢课：只看计划（纯只读）
+python run.py autograb             # 自动抢课：演练（默认不发写请求，结束发桌面通知）
+python run.py autograb --real      # 自动抢课：**真实提交**（会写进课表）
+python run.py autograb --at 12:30:00 --real   # 到点（服务端时钟）自动开抢
+python run.py grab --course 71 --slot <id> --in 20   # 单目标定时提交引擎演练
 python run.py scrub <file.har>     # 脱敏 HAR：抹掉 Cookie/Authorization/密码 MD5 与敏感响应体后再分析
 python run.py stop                 # 让正在运行的 login/recon 优雅收尾（HAR 才会落盘！）
 python run.py logout               # 删除本地会话文件
