@@ -1535,7 +1535,24 @@ class GrabPanel(QDialog):
         viewport_h = scroll.viewport().height()
         expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
                f"内容 {content_h}px > 视口 {viewport_h}px")
+        # ── 源码卫生：**不许有重复定义的顶层函数**（后一个会静默覆盖前一个）──
+        # 实测教训：脚本重复应用导致 config.py 里出现三个 notes_dir()，改动看起来"没生效"。
+        import ast as _ast
+
+        duplicates: list[str] = []
+        for module_path in sorted(pathlib.Path(__file__).parent.glob("*.py")):
+            tree = _ast.parse(module_path.read_text(encoding="utf-8"))
+            names = [node.name for node in tree.body if isinstance(node, _ast.FunctionDef)]
+            repeated = sorted({name for name in names if names.count(name) > 1})
+            if repeated:
+                duplicates.append(f"{module_path.name}:{repeated}")
+        expect("包内没有重复定义的顶层函数", not duplicates, str(duplicates))
+
         # ── 下载实验笔记（用户 2026-10-08 新增功能）──
+        expect("默认下载到『下载』文件夹下的子目录（不是 AppData）",
+               "Downloads" in str(app_config.notes_dir())
+               or str(app_config.notes_dir()).startswith(str(app_config.downloads_dir())),
+               str(app_config.notes_dir()))
         expect("有『下载实验笔记』按钮",
                self.btn_download is not None and "下载" in self.btn_download.text(),
                self.btn_download.text() if self.btn_download else "无")

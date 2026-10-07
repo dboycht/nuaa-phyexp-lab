@@ -127,16 +127,42 @@ def logs_dir() -> Path:
     return home_dir() / "logs"
 
 
-def notes_dir() -> Path:
-    """实验笔记/报告纸 PDF 的默认下载目录（运行期数据，**绝不进仓库**）。"""
-    return home_dir() / "notes"
+def downloads_dir() -> Path:
+    """系统的「下载」文件夹。
+
+    用 Windows **已知文件夹** API 取，而不是拼 `%USERPROFILE%\\Downloads` ——
+    很多人把下载目录挪到了别的盘（C 盘小），拼字符串会指到不存在的路径。
+    取不到时退回 `%USERPROFILE%\\Downloads`，再退回运行目录（保证总有地方可写）。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                        ("Data3", wintypes.WORD), ("Data4", ctypes.c_byte * 8)]
+
+        # FOLDERID_Downloads = {374DE290-123F-4565-9164-39C4925E467B}
+        folder_id = GUID(0x374DE290, 0x123F, 0x4565,
+                         (ctypes.c_byte * 8)(0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B))
+        path_ptr = ctypes.c_wchar_p()
+        result = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(path_ptr))
+        if result == 0 and path_ptr.value:
+            resolved = Path(path_ptr.value)
+            ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+            if resolved.is_dir():
+                return resolved
+    except Exception:  # noqa: BLE001 - 取不到就退回下面的备选，不让它影响下载
+        pass
+    fallback = Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Downloads"
+    return fallback if fallback.is_dir() else home_dir()
 
 
 def notes_dir() -> Path:
-    """实验笔记/报告纸 PDF 的默认下载目录（运行期数据，**绝不进仓库**）。"""
-    return home_dir() / "notes"
+    """实验笔记/报告纸 PDF 的存放目录 = **「下载」文件夹下的「实验笔记」子目录**。
 
-
-def notes_dir() -> Path:
-    """实验笔记/报告纸 PDF 的默认下载目录（运行期数据，**绝不进仓库**）。"""
-    return home_dir() / "notes"
+    用户 2026-10-08："不应该下载到下载文件夹吗" ⇒ 默认改到下载文件夹；
+    放一个子目录是为了不跟其它下载文件混在一起（要平铺在 Downloads 根目录就改这里）。
+    """
+    return downloads_dir() / "实验笔记"
