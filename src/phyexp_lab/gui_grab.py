@@ -91,10 +91,11 @@ class GridLoader(QThread):
             course_id = self.plan_cfg.course_id or courses[0].get("id")
             rows, names = planner.load_course_slots(client, course_id)
             occupied, taken = planner.occupied_from_electives(client, semester.get("id"), course_id)
+            elections = planner.my_elections(client, semester.get("id"), course_id)
             cells = planner.grid_cells(self.plan_cfg, rows, days=self.days, occupied=occupied,
                                        project_names=names, taken_projects=taken)
             self.loaded.emit({"course_id": course_id, "courses": courses, "cells": cells,
-                              "occupied": occupied, "taken": taken,
+                              "occupied": occupied, "taken": taken, "elections": elections,
                               "semester": semester.get("name")})
         except Exception as exc:  # noqa: BLE001 - 线程里必须自己兜异常
             self.failed.emit(f"{type(exc).__name__}：{exc}\n{traceback.format_exc()[:600]}")
@@ -795,13 +796,26 @@ class GrabPanel(QDialog):
         self._set_chip(self.chip_window, f"窗口：{days[0][5:]} ~ {days[-1][5:]}（两周）")
         self.log_line(f"已加载：课程 id={payload['course_id']}，当前可见可约单元 {avail} 个，"
                       f"已有选课 {taken} 个，已选过实验 {len(payload['taken'])} 个")
-        # 左下角：课表里已有的实验（用户 2026-10-08 要求在这里能看到科目有哪些）
+        # 左下角：**本周期（表格这两周）内已选的科目**（用户 2026-10-08 明确口径）——
+        # 例："日期窗口是 10-01~10-08，我有一条 10-06 的已选" ⇒ 这一行就要显示它。
+        # 窗口**外**的已选不进这一行（只进悬停提示），避免把不相关的日期混进来。
+        elections = list(payload.get("elections") or [])
+        window = set(self.days())
+        inside = [e for e in elections if e["date"] in window]
+        outside = [e for e in elections if e["date"] not in window]
+        if inside:
+            shown = "；".join(f"{e['date'][5:]} {e['period']} {e['name']}" for e in inside)
+            self.mine_label.setText(f"本周期内已选（{len(inside)} 个）：{shown}")
+        else:
+            self.mine_label.setText("本周期内还没有已选课。")
+        tips: list[str] = []
+        if outside:
+            tips.append("窗口外的已选：" +
+                        "；".join(f"{e['date'][5:]} {e['period']} {e['name']}" for e in outside))
         mine = dict(payload.get("taken") or {})
         if mine:
-            self.mine_label.setText(
-                f"课表里已有的实验（{len(mine)} 个）：" + "、".join(sorted(mine.values())))
-        else:
-            self.mine_label.setText("课表里还没有实验。")
+            tips.append("已选过的实验（同一实验不重复选）：" + "、".join(sorted(mine.values())))
+        self.mine_label.setToolTip("\n".join(tips))
         if avail == 0:
             self.log_line("       注意：现在看不到可约单元，这在窗口未开时是正常的 ——"
                           "你照常点选空闲时段即可，到点后系统会按当时的实时余量重新筛候选。")
@@ -1306,6 +1320,23 @@ class GrabPanel(QDialog):
                bool(fresh.settings_summary.text()) and "真实提交" in fresh.settings_summary.text(),
                fresh.settings_summary.text()[:48])
         fresh.deleteLater()
+
+        # 左下角：**窗口内**的已选要显示（含日期与科目），窗口外的不进可见行（用户 2026-10-08）
+        mine_text = self.mine_label.text()
+        today_mmdd = dt.date.today().strftime("%m-%d")
+        expect("左下角显示本周期内已选（含日期）",
+               "本周期内已选" in mine_text and today_mmdd in mine_text,
+               mine_text[:70])
+        expect("左下角显示本周期内已选的科目名",
+               "磁阻传感器与地磁场测量" in mine_text, mine_text[:70])
+        outside_day = (dt.date.today() + dt.timedelta(days=35)).strftime("%m-%d")
+        expect("窗口外的已选不进可见行",
+               outside_day not in mine_text and "分压限流电路实验" not in mine_text,
+               mine_text[:70])
+        expect("窗口外的已选在悬停提示里（信息不丢）",
+               outside_day in self.mine_label.toolTip()
+               and "分压限流电路实验" in self.mine_label.toolTip(),
+               self.mine_label.toolTip()[:70])
         expect("设置区默认折叠（保持紧凑）", not self.settings_box.isVisible())
         expect("设置摘要始终可见且写明提交方式",
                bool(self.settings_summary.text()) and
@@ -1530,9 +1561,16 @@ class DemoClient:
         self.claims = {"exp": 4102444800}
         self.submit_calls: list[str] = []
         self.electives = [{
+            # 窗口内（今天）：左下角应该显示它
             "id": 90001, "schedule_id": 4841, "project_id": 445, "schedule_status": "elected",
             "schedules": {"date": dt.date.today().isoformat(), "periods": {"name": "上午1、2节"},
                           "projects": {"name": "磁阻传感器与地磁场测量（519）"}},
+        }, {
+            # 窗口外（35 天后）：**不该**出现在左下角的可见行里，只进悬停提示
+            "id": 90002, "schedule_id": 4999, "project_id": 448, "schedule_status": "elected",
+            "schedules": {"date": (dt.date.today() + dt.timedelta(days=35)).isoformat(),
+                          "periods": {"name": "下午7、8节"},
+                          "projects": {"name": "分压限流电路实验（543）"}},
         }]
 
     def prewarm(self) -> int:

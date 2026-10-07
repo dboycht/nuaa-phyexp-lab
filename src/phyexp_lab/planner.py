@@ -121,11 +121,16 @@ def load_course_slots(client: PhyExpClient, course_id: Any) -> tuple[list[dict],
     return rows, names
 
 
-def occupied_from_electives(client: PhyExpClient, semester_id: Any,
-                            course_id: Any) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
-    """从"我的选课记录"算出：已占用的「日期+节次」与已选过的实验项目（R2/R8 的前置）。"""
-    occupied: dict[tuple[str, str], str] = {}
-    taken: dict[str, str] = {}
+def my_elections(client: PhyExpClient, semester_id: Any, course_id: Any) -> list[dict]:
+    """我的选课**明细**（每条的日期/节次/科目名），界面显示与去重共用这一份解析。
+
+    返回按 (日期, 节次) 排序的 `[{"date","period","name","project_id","record_id"}]`。
+
+    为什么单独抽出来：左下角要显示「**本周期（表格窗口）内**已选的科目」，
+    需要日期 + 科目名一起；而原来 `occupied_from_electives` 只留下"选课记录 id"，
+    科目名又在另一个只按 project_id 归并的字典里，两边凑不出"某天某个节次是哪门实验"。
+    """
+    items: list[dict] = []
     for record in client.my_electives(semester_id, course_id):
         schedule = record.get("schedules") or {}
         date = str(schedule.get("date") or "")
@@ -135,13 +140,29 @@ def occupied_from_electives(client: PhyExpClient, semester_id: Any,
             period = grabconfig.normalize_period(period_raw) if period_raw else ""
         except grabconfig.ConfigError:
             period = period_raw  # 名字不认得也照实记录，不阻断规划
-        if date and period:
-            occupied[(date, period)] = f"选课记录 id={record.get('id')}"
+        if not (date and period):
+            continue
         project = schedule.get("projects")
         project_id = str(record.get("project_id") or "")
-        if project_id:
-            name = project.get("name") if isinstance(project, dict) else None
-            taken[project_id] = str(name or project_id)
+        name = (project.get("name") if isinstance(project, dict) else None) or project_id
+        items.append({"date": date, "period": period, "name": str(name),
+                      "project_id": project_id, "record_id": record.get("id")})
+    items.sort(key=lambda item: (item["date"], item["period"]))
+    return items
+
+
+def occupied_from_electives(client: PhyExpClient, semester_id: Any,
+                            course_id: Any) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
+    """从"我的选课记录"算出：已占用的「日期+节次」与已选过的实验项目（R2/R8 的前置）。
+
+    解析统一走 `my_elections()`（单一来源，避免两处各解析一遍而口径不同）。
+    """
+    occupied: dict[tuple[str, str], str] = {}
+    taken: dict[str, str] = {}
+    for item in my_elections(client, semester_id, course_id):
+        occupied[(item["date"], item["period"])] = f"选课记录 id={item['record_id']}"
+        if item["project_id"]:
+            taken[item["project_id"]] = item["name"]
     return occupied, taken
 
 
