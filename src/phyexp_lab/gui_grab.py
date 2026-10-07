@@ -190,7 +190,7 @@ class GrabPanel(QDialog):
         #:  自检与真实运行共用逻辑时，一切"需要人"的副作用都要能关掉）。
         self.suppress_dialogs = suppress_dialogs
         self.setWindowTitle("抢课面板（两周空闲时段 → 到点自动抢 → 结果可退课）")
-        self.resize(1180, 1000)
+        self.resize(1180, 1032)
         self.setMinimumSize(980, 640)   # 允许缩到小屏也能用（实测提醒：不留余量时最小高度会顶到 1053）
         self.client_factory = client_factory or (lambda: __import__(
             "phyexp_lab.api", fromlist=["PhyExpClient"]).PhyExpClient(timeout=20.0))
@@ -394,7 +394,7 @@ class GrabPanel(QDialog):
         # 抢到的条目：**可滚动的勾选列表**（条目多时不会挤成一行、也不会被截断）
         picks_scroll = QScrollArea()
         picks_scroll.setWidgetResizable(True)
-        picks_scroll.setMinimumHeight(44)
+        picks_scroll.setMinimumHeight(40)
         picks_scroll.setMaximumHeight(110)
         picks_scroll.setStyleSheet(
             f"QScrollArea {{ background: {theme.ACTIVE.surface};"
@@ -437,7 +437,7 @@ class GrabPanel(QDialog):
         self.log.setReadOnly(True)
         self.log.setFont(theme.monospace(9))
         self.log.setMinimumHeight(56)
-        self.log.setMaximumHeight(96)
+        self.log.setMaximumHeight(88)
         self.btn_clear_log = QPushButton("清空日志")
         self.btn_clear_log.setIcon(theme.qicon("undo", 14))
         self.btn_clear_log.clicked.connect(self.log.clear)
@@ -618,7 +618,7 @@ class GrabPanel(QDialog):
         days = self.days()
         self._set_chip(self.chip_window, f"窗口：{days[0][5:]} ~ {days[-1][5:]}（两周）")
         self.log_line(f"已加载：课程 id={payload['course_id']}，当前可见可约单元 {avail} 个，"
-                      f"已有选课 {taken} 个，已做过实验 {len(payload['taken'])} 个")
+                      f"已有选课 {taken} 个，已选过实验 {len(payload['taken'])} 个")
         if avail == 0:
             self.log_line("       注意：现在看不到可约单元，**这在窗口未开时是正常的** ——"
                           "你照常点选空闲时段即可，到点后系统会按当时的实时余量重新筛候选。")
@@ -630,9 +630,11 @@ class GrabPanel(QDialog):
             if state == "taken":
                 dropped += 1
                 self.log_line(f"       提示：{key[0]} {key[1]} 你已有选课，该时段不会再选新的。")
-            elif state == "all_taken":
+            elif state == "all_elected":
                 dropped += 1
-                self.log_line(f"       提示：{key[0]} {key[1]} 的实验你都做过了，到点不会有候选。")
+                names_blocked = "、".join((self.cells.get(key) or {}).get("blocked_projects") or [])
+                self.log_line(f"       提示：{key[0]} {key[1]} 只放了你已选过的实验"
+                              f"（{names_blocked}）；同一实验不重复选 ⇒ 该时段到点不会有候选。")
         del dropped
         self._rebuild_grid()
 
@@ -720,8 +722,8 @@ class GrabPanel(QDialog):
             hint = "当前已满"
         elif state == "taken":
             hint = "已有选课"
-        elif state == "all_taken":
-            hint = "已做过"
+        elif state == "all_elected":
+            hint = "无新实验"
         else:
             hint = "未放出"
         if selected:
@@ -737,7 +739,8 @@ class GrabPanel(QDialog):
                          f"\n实验：{info.get('project_name')}\n场次 id：{info.get('best_slot_id')}",
             "full": "当前已满",
             "taken": f"你在这个时段已有选课（{info.get('reason') or ''}）",
-            "all_taken": "这个节次的实验你都做过了",
+            "all_elected": ("该节次只放了你**已选过**的实验 —— 同一实验不重复选，所以这里没有可抢的新实验。\n"
+                            + "涉及：" + "、".join(info.get("blocked_projects") or ["（未取到名称）"])),
             "none": "当前看不到这个节次的场次（窗口未开/未排课 —— **属正常**）",
         }.get(state, state)
         return (f"{head}当前可见情况：{current}\n\n"
@@ -987,7 +990,7 @@ class GrabPanel(QDialog):
         taken_ids = set((payload_holder.get("taken") or {}).keys())
         leaked = [k for k, v in self.cells.items()
                   if v["state"] == "available" and str(v.get("best_slot_id")) in taken_ids]
-        expect("已做过的实验不出现在可约单元（D6）", not leaked, str(leaked))
+        expect("已选过的实验不出现在可约单元（D6）", not leaked, str(leaked))
 
         # ── 真实提交路径（用假客户端，不发网络请求）：验证"结果列表 + 可退课"这条链 ──
         real_plan = self.build_plan_from_ui()
@@ -1012,7 +1015,14 @@ class GrabPanel(QDialog):
             real_engine.close()
 
         # ── 布局真值判据（按 memory/04 §25：量"滚动区视口 vs 内容高度"，别看截图）──
+        # ⚠️ **采样时机**：只 show() + 一两次 processEvents 时布局**还没稳定** ——
+        #    实测那时量到 266/266"刚好放得下"，而真实路径（事件循环跑起来后）是 266/240 ⇒ 门禁**假绿**。
+        #    正解：显式 `layout().activate()` + `adjustSize()` + 多泵几次事件后再量。
         self.show()
+        for _ in range(3):
+            QApplication.processEvents()
+        self.layout().activate()
+        self.grid_host.adjustSize()
         QApplication.processEvents()
         QApplication.processEvents()
         scroll = self.grid_host.parent().parent()
@@ -1119,7 +1129,7 @@ class DemoClient:
         table = {
             475: [self._row(5001, day1, "下午5、6节", 475, 24),
                   self._row(5002, day3, "上午1、2节", 475, 0)],      # 已满
-            445: [self._row(5003, day1, "上午1、2节", 445, 9)],       # 已做过该实验
+            445: [self._row(5003, day1, "上午1、2节", 445, 9)],       # 已选过该实验
             448: [self._row(5004, day1, "晚上9，10节", 448, 15)],
         }
         return table.get(project_id, [])

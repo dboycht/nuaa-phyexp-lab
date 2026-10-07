@@ -43,7 +43,7 @@ class Palette:
     warn_soft: str
     danger: str             #: 失败/危险
     danger_soft: str
-    taken: str              #: 已选/已做过（中性偏紫，与可约区分）
+    taken: str              #: 已选过（**不是"已完成"**：本项目不查考勤；中性偏紫，与可约区分）
     taken_soft: str
     disabled: str           #: 不可用文字
     disabled_soft: str      #: 不可用底色
@@ -220,7 +220,7 @@ CELL_STYLES: dict[str, CellStyle] = {
     "none": CellStyle(background=ACTIVE.disabled_soft, border="#EDF1F4",
                       color="#C3CAD3"),
     "taken": CellStyle(background=ACTIVE.taken_soft, border="#DCC8F0", color=ACTIVE.taken),
-    "all_taken": CellStyle(background=ACTIVE.taken_soft, border="#DCC8F0", color=ACTIVE.taken),
+    "all_elected": CellStyle(background=ACTIVE.taken_soft, border="#DCC8F0", color=ACTIVE.taken),
 }
 
 

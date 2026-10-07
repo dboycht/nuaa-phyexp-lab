@@ -163,6 +163,7 @@ def build_plan(plan_cfg: GrabPlan, *, rows: list[dict], course_id: Any,
         if remaining is None or remaining <= 0:
             continue
         project_id = str(row.get("project_id") or "")
+        # （`taken_projects` 来自"我的选课记录"，语义是**已选过**，不是"已完成"）
         if plan_cfg.skip_taken_projects and project_id in taken_projects:
             continue
         locations = row.get("locations") or {}
@@ -219,7 +220,10 @@ def build_plan(plan_cfg: GrabPlan, *, rows: list[dict], course_id: Any,
         elif all((_slot_remaining(r) or 0) <= 0 for r in published):
             reason = f"该节次 {len(published)} 个场次都已满（余量 0）"
         else:
-            reason = "候选都被过滤掉了（可能都是已选过的实验项目）"
+            names_blocked = sorted({project_names.get(str(r.get("project_id") or ""),
+                                                       f"项目 {r.get('project_id')}")
+                                    for r in published})
+            reason = "该节次只放了这些实验，你都已选过：" + "、".join(names_blocked)
         plan.uncovered.append(Uncovered(free=free, reason=reason))
 
     return plan
@@ -245,14 +249,16 @@ def grid_cells(plan_cfg: GrabPlan, rows: list[dict], *, days: list[str],
     每个单元给出 GUI 需要的最小信息（**纯函数，便于单测**）：
 
     - `state`: `available`（可约）/ `full`（已满）/ `none`（系统没有这个节次）/
-      `taken`（该时段已有我的选课）/ `all_taken`（该节次的实验全做过了）
+      `taken`（该时段已有我的选课）/ `all_elected`（该节次只放了你**已选过**的实验 ⇒ 没有新实验可抢）
     - `remaining` / `total`：余量与场次数
     - `best_slot_id`：余量最多的那个场次 id（点选后提交它）
     - `project_name`：那个场次的实验名（界面提示用）
 
     ⚠️ **只统计未做过的实验项目**（D6/R8：已选过的实验不能再选）——
     否则界面会把"点了也会被跳过"的单元格显示成可点，属于误导。
-    若某节次的实验**全都做过**，状态给 `all_taken`，界面据此显示"已做过"并禁用。
+    若某节次放的实验**你都已经选过**，状态给 `all_elected`，
+    界面据此显示"无新实验"并说明涉及哪些实验（**不写"已做过"** —— 本项目不查考勤，
+    只知"已选过"；写成"做过"会让用户以为"未来的实验也做完了"，实测引起过困惑）。
     """
     occupied = dict(occupied or {})
     project_names = dict(project_names or {})
@@ -274,12 +280,17 @@ def grid_cells(plan_cfg: GrabPlan, rows: list[dict], *, days: list[str],
                               "best_slot_id": None, "project_name": "",
                               "reason": "系统未排该节次"}
                 continue
-            # D6/R8：已做过的实验不再出现在可选项里
+            # D6/R8：**已选过**的实验不再出现在可选项里
+            #   ⚠️ 注意口径：这里只知道"已选过（elected）"，**不查考勤**，
+            #   所以措辞一律用"已选过"，不要写成"已做过"（用户 2026-10-07 因此困惑过）。
             fresh = [r for r in candidates if str(r.get("project_id") or "") not in taken_ids]
             if not fresh:
-                cells[key] = {"state": "all_taken", "remaining": 0, "total": len(candidates),
+                blocked = sorted({str(r.get("project_id") or "") for r in candidates})
+                blocked_names = [project_names.get(pid, f"项目 {pid}") for pid in blocked]
+                cells[key] = {"state": "all_elected", "remaining": 0, "total": len(candidates),
                               "best_slot_id": None, "project_name": "",
-                              "reason": "该节次的实验你都做过了"}
+                              "blocked_projects": blocked_names,
+                              "reason": "该节次只放了这些实验，你都已选过：" + "、".join(blocked_names)}
                 continue
             usable = [r for r in fresh if (_slot_remaining(r) or 0) > 0]
             if not usable:
