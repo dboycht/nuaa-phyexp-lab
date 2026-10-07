@@ -519,13 +519,28 @@ class GrabPanel(QDialog):
         self.picks_layout.addStretch(1)
         picks_scroll.setWidget(self.picks_host)
 
-        # 左下角：**课表里已有的实验**（用户 2026-10-08：把本轮的科目显示在左下角）
-        self.mine_label = QLabel("")
-        self.mine_label.setWordWrap(True)
-        self.mine_label.setObjectName("sub")
         self.picks_scroll = picks_scroll
         result_layout.addWidget(picks_scroll)
-        result_layout.addWidget(self.mine_label)   # 左下角：课表里已有的实验
+
+        # 左下角：**本周期内已选**——用**列表**展示（用户 2026-10-08：一行长文字太麻烦）
+        self.mine_title = QLabel("本周期内已选（0 个）")
+        self.mine_title.setObjectName("step")
+        result_layout.addWidget(self.mine_title)
+        mine_scroll = QScrollArea()
+        mine_scroll.setWidgetResizable(True)
+        mine_scroll.setMinimumHeight(30)
+        mine_scroll.setMaximumHeight(104)
+        mine_scroll.setStyleSheet(
+            f"QScrollArea {{ background: {theme.ACTIVE.surface};"
+            f" border: 1px solid {theme.ACTIVE.border}; border-radius: 8px; }}")
+        self.mine_host = QWidget()
+        self.mine_layout = QVBoxLayout(self.mine_host)
+        self.mine_layout.setContentsMargins(8, 5, 8, 5)
+        self.mine_layout.setSpacing(1)
+        self.mine_layout.addStretch(1)
+        mine_scroll.setWidget(self.mine_host)
+        self.mine_scroll = mine_scroll
+        result_layout.addWidget(mine_scroll)
 
         bottom = QHBoxLayout()
         self.picks_hint = QLabel(theme.muted("抢到的条目会列在上面，勾选后可退课"))
@@ -796,18 +811,13 @@ class GrabPanel(QDialog):
         self._set_chip(self.chip_window, f"窗口：{days[0][5:]} ~ {days[-1][5:]}（两周）")
         self.log_line(f"已加载：课程 id={payload['course_id']}，当前可见可约单元 {avail} 个，"
                       f"已有选课 {taken} 个，已选过实验 {len(payload['taken'])} 个")
-        # 左下角：**本周期（表格这两周）内已选的科目**（用户 2026-10-08 明确口径）——
-        # 例："日期窗口是 10-01~10-08，我有一条 10-06 的已选" ⇒ 这一行就要显示它。
-        # 窗口**外**的已选不进这一行（只进悬停提示），避免把不相关的日期混进来。
+        # 左下角：**本周期（表格这两周）内已选**，用列表展示（窗口外的不进列表，只进标题提示）
         elections = list(payload.get("elections") or [])
         window = set(self.days())
         inside = [e for e in elections if e["date"] in window]
         outside = [e for e in elections if e["date"] not in window]
-        if inside:
-            shown = "；".join(f"{e['date'][5:]} {e['period']} {e['name']}" for e in inside)
-            self.mine_label.setText(f"本周期内已选（{len(inside)} 个）：{shown}")
-        else:
-            self.mine_label.setText("本周期内还没有已选课。")
+        self._rebuild_mine_list(inside)
+        self.mine_title.setText(f"本周期内已选（{len(inside)} 个）")
         tips: list[str] = []
         if outside:
             tips.append("窗口外的已选：" +
@@ -815,7 +825,7 @@ class GrabPanel(QDialog):
         mine = dict(payload.get("taken") or {})
         if mine:
             tips.append("已选过的实验（同一实验不重复选）：" + "、".join(sorted(mine.values())))
-        self.mine_label.setToolTip("\n".join(tips))
+        self.mine_title.setToolTip("\n".join(tips))
         if avail == 0:
             self.log_line("       注意：现在看不到可约单元，这在窗口未开时是正常的 ——"
                           "你照常点选空闲时段即可，到点后系统会按当时的实时余量重新筛候选。")
@@ -1149,6 +1159,63 @@ class GrabPanel(QDialog):
             self.result_box.setTitle(
                 f"本轮选中的实验（{len(report.succeeded)} 个，勾选后可退课）")
 
+    def _fit_mine_height(self) -> None:
+        """把"本周期内已选"列表的高度设成刚好等于内容（上限 104），不留空白尾。
+
+        与网格定高同一套路：布局未结算时就量会得到偏小的值 ⇒ 延后一拍 + 兜底判断。
+        """
+        content = self.mine_host.sizeHint().height()
+        if content < 8:                      # 还没渲染好，等下一次
+            QTimer.singleShot(40, self._fit_mine_height)
+            return
+        self.mine_scroll.setFixedHeight(min(content + 4, 104))
+
+    @staticmethod
+    def _row_text(row) -> str:
+        """把一行列表的文字拼起来（自检用来核对内容）。"""
+        parts: list[str] = []
+        for child in row.findChildren(QLabel):
+            text = child.text().strip()
+            if text:
+                parts.append(text)
+        return " ".join(parts)
+
+    def _rebuild_mine_list(self, inside: list[dict]) -> None:
+        """把"本周期内已选"渲染成**一行一条的列表**（用户 2026-10-08 要求）。
+
+        每行：`[图标] 日期 节次 · 科目名`；"日期 节次"固定宽度对齐，科目名占剩余宽度。
+        """
+        while self.mine_layout.count():
+            item = self.mine_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not inside:
+            empty = QLabel(theme.muted("（本周期内还没有已选课）"))
+            empty.setObjectName("step")
+            self.mine_layout.addWidget(empty)
+            self.mine_layout.addStretch(1)
+            return
+        for election in inside:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            icon = QLabel()
+            icon.setPixmap(theme.icon_pixmap("check", 13, theme.ACTIVE.taken))
+            row_layout.addWidget(icon)
+            when = QLabel(f"{election['date'][5:]} {election['period']}")
+            when.setObjectName("step")
+            when.setMinimumWidth(96)          # 对齐用：日期 + 节次
+            row_layout.addWidget(when)
+            name = QLabel(election["name"])
+            name.setToolTip(f"{election['date']} {election['period']}　{election['name']}")
+            row_layout.addWidget(name, 1)
+            self.mine_layout.addWidget(row)
+        self.mine_layout.addStretch(1)
+        # 按内容定高（延后一拍再量：布局未结算时 sizeHint 会偏小，见网格那次同款教训）
+        QTimer.singleShot(0, self._fit_mine_height)
+
     def _on_report(self, report) -> None:
         self._results = list(report.succeeded)
         self._update_result_title(report)
@@ -1321,22 +1388,34 @@ class GrabPanel(QDialog):
                fresh.settings_summary.text()[:48])
         fresh.deleteLater()
 
-        # 左下角：**窗口内**的已选要显示（含日期与科目），窗口外的不进可见行（用户 2026-10-08）
-        mine_text = self.mine_label.text()
+        # 左下角：**窗口内**的已选要以**列表**显示（一行一条），窗口外的不进列表（用户 2026-10-08）
+        rows = [self.mine_layout.itemAt(i).widget() for i in range(self.mine_layout.count())]
+        row_texts = [self._row_text(w) for w in rows if w is not None]
         today_mmdd = dt.date.today().strftime("%m-%d")
-        expect("左下角显示本周期内已选（含日期）",
-               "本周期内已选" in mine_text and today_mmdd in mine_text,
-               mine_text[:70])
-        expect("左下角显示本周期内已选的科目名",
-               "磁阻传感器与地磁场测量" in mine_text, mine_text[:70])
         outside_day = (dt.date.today() + dt.timedelta(days=35)).strftime("%m-%d")
-        expect("窗口外的已选不进可见行",
-               outside_day not in mine_text and "分压限流电路实验" not in mine_text,
-               mine_text[:70])
-        expect("窗口外的已选在悬停提示里（信息不丢）",
-               outside_day in self.mine_label.toolTip()
-               and "分压限流电路实验" in self.mine_label.toolTip(),
-               self.mine_label.toolTip()[:70])
+        expect("左下角是列表（每行一个已选，不是一整串文字）",
+               len(row_texts) == 1 and today_mmdd in row_texts[0],
+               str(row_texts))
+        expect("列表行含日期+节次+科目名",
+               bool(row_texts) and today_mmdd in row_texts[0]
+               and "上午1、2节" in row_texts[0] and "磁阻传感器与地磁场测量" in row_texts[0],
+               str(row_texts))
+        expect("标题写明本周期内已选数量",
+               "本周期内已选（1 个）" in self.mine_title.text(), self.mine_title.text())
+        expect("窗口外的已选不进列表",
+               all(outside_day not in t and "分压限流电路" not in t for t in row_texts),
+               str(row_texts))
+        expect("窗口外的已选在标题提示里（信息不丢）",
+               outside_day in self.mine_title.toolTip()
+               and "分压限流电路" in self.mine_title.toolTip(),
+               self.mine_title.toolTip()[:70])
+        expect("左下角列表高度合理（不抢结果区）", 24 <= self.mine_scroll.height() <= 120,
+               f"高 {self.mine_scroll.height()}px")
+        # 列表高度要**贴内容**（不留空白尾）：框高不该明显超过内容
+        self._fit_mine_height()
+        expect("左下角列表高度贴合内容（无空白尾）",
+               self.mine_scroll.height() <= self.mine_host.sizeHint().height() + 12,
+               f"框高 {self.mine_scroll.height()} vs 内容 {self.mine_host.sizeHint().height()}")
         expect("设置区默认折叠（保持紧凑）", not self.settings_box.isVisible())
         expect("设置摘要始终可见且写明提交方式",
                bool(self.settings_summary.text()) and
