@@ -136,7 +136,7 @@ class GrabWorker(QThread):
         """请求停止：置位 + **透传给引擎**。
 
         ⚠️ 原来只置位自己的标志，而引擎的重试循环根本不看它 ⇒ 点了「停止」仍会继续
-        重试并提交（用户 2026-10-08 实测报上来的 bug）。
+        重试并提交（用户 2026-10-07 实测报上来的 bug）。
         """
         self._cancel = True
         engine = getattr(self, "_engine", None)
@@ -267,7 +267,7 @@ class GrabPanel(QDialog):
         self.setMinimumSize(1040, 600)  # 左列(14 天网格) + 右列(日志 220) 的最低要求
         self.client_factory = client_factory or (lambda: __import__(
             "phyexp_lab.api", fromlist=["PhyExpClient"]).PhyExpClient(timeout=20.0))
-        # ⚠️ 这里**不要**再硬编码 dry_run=True（旧的安全默认）：用户 2026-10-08 明确要求
+        # ⚠️ 这里**不要**再硬编码 dry_run=True（旧的安全默认）：用户 2026-10-07 明确要求
         #    「默认的是真实提交，不是演示模式」⇒ 用 GrabPlan 的当前默认值（dry_run=False）。
         #    想演练就在「设置」里勾演练模式（或给 GrabPanel 传 plan_cfg）。
         self.plan_cfg = plan_cfg or GrabPlan()
@@ -299,7 +299,7 @@ class GrabPanel(QDialog):
         root.setContentsMargins(10, 8, 10, 8)
         root.setSpacing(0)
 
-        # 两栏布局（用户 2026-10-08）：左列 = 完整工作流；右列 = 运行日志（**整列高度**）。
+        # 两栏布局（用户 2026-10-07）：左列 = 完整工作流；右列 = 运行日志（**整列高度**）。
         # 用 QSplitter 而不是固定网格：用户可拖动分隔条，日志也能折叠。
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.setChildrenCollapsible(False)
@@ -464,7 +464,7 @@ class GrabPanel(QDialog):
         self.btn_start = QPushButton("立即抢课")
         self.btn_start.setObjectName("primary")
         self.btn_start.setMinimumWidth(170)      # 容得下"定时抢课（等到 10:00:00）"
-        # 文案 = 当前模式（用户 2026-10-08）：勾「到点开抢」前是"立即"，勾上后写明等到几点
+        # 文案 = 当前模式（用户 2026-10-07）：勾「到点开抢」前是"立即"，勾上后写明等到几点
         self.time_enable.toggled.connect(self._refresh_start_button)
         self.time_edit.timeChanged.connect(self._refresh_start_button)
         self.btn_start.clicked.connect(self.start_grab)
@@ -543,7 +543,7 @@ class GrabPanel(QDialog):
         self.picks_scroll = picks_scroll
         result_layout.addWidget(picks_scroll)
 
-        # 左下角：**本周期内已选**——用**列表**展示（用户 2026-10-08：一行长文字太麻烦）
+        # 左下角：**本周期内已选**——用**列表**展示（用户 2026-10-07：一行长文字太麻烦）
         self.mine_title = QLabel("本周期内已选（0 个）")
         self.mine_title.setObjectName("step")
         result_layout.addWidget(self.mine_title)
@@ -580,7 +580,7 @@ class GrabPanel(QDialog):
         self.btn_download.clicked.connect(self.download_papers)
         bottom.addWidget(self.btn_download)
         result_layout.addLayout(bottom)
-        # 结果卡吃掉左列剩余高度（用户 2026-10-08：不要留空白垃圾区域）——
+        # 结果卡吃掉左列剩余高度（用户 2026-10-07：不要留空白垃圾区域）——
         # 网格卡按内容自适应（内部不留空），结果卡随窗口变高，勾选列表也跟着变高。
         left_layout.addWidget(self.result_box, 1)
 
@@ -1041,7 +1041,7 @@ class GrabPanel(QDialog):
     def _fit_grid_height(self) -> None:
         """把网格滚动区的高度设成**刚好等于内容高度**（上限 520）。
 
-        为什么要这样（用户 2026-10-08："又大又空"）：
+        为什么要这样（用户 2026-10-07："又大又空"）：
         · 交给布局自由伸缩 -> 多余的空白落在网格卡内部，看起来又大又空；
         · 固定成小高度 -> 5 个节次看不全、被迫滚动。
         按内容定高则两者都不会发生；内容超过上限时才出现滚动。
@@ -1151,7 +1151,7 @@ class GrabPanel(QDialog):
         """按钮文案直接写出**将要执行哪种模式**（立即 / 定时等到几点）。
 
         为什么：模式原本只由一个勾选框决定，同一个"开始抢课"按钮有两种行为，
-        用户不易看出当前是哪一种（用户 2026-10-08 就问了"是有两种窗口吗"）。
+        用户不易看出当前是哪一种（用户 2026-10-07 就问了"是有两种窗口吗"）。
         文案随模式变，最省地方也最直白。
         """
         if self.time_enable.isChecked():
@@ -1263,7 +1263,7 @@ class GrabPanel(QDialog):
         self._critical("抢课失败", message[:500])
 
     def _update_result_title(self, report) -> None:
-        """结果卡标题写明「本轮选中几个」（用户 2026-10-08：左下角要能看到选中的科目）。"""
+        """结果卡标题写明「本轮选中几个」（用户 2026-10-07：左下角要能看到选中的科目）。"""
         if getattr(report, "dry_run", False):
             self.result_box.setTitle(
                 f"本轮结果（演练：本应提交 {len(report.would_submit)} 个）")
@@ -1320,7 +1320,7 @@ class GrabPanel(QDialog):
             f"本周期管理（已选 {inside} · 待抢 {len(self._pending_slots())}）")
 
     def _rebuild_mine_list(self, inside: list[dict], pending: list[tuple[str, str]]) -> None:
-        """本周期**管理列表**（用户 2026-10-08）：
+        """本周期**管理列表**（用户 2026-10-07）：
 
         - 已选行：带复选框（勾上 = 准备退掉），行尾写科目名；
         - 待抢行：当前你设为空闲、准备抢的时段（窗口内），带 × 可随时从计划里去掉。
@@ -1442,7 +1442,7 @@ class GrabPanel(QDialog):
         return list(getattr(self, "_elections_in_window", []))
 
     def download_papers(self) -> None:
-        """批量下载实验笔记 PDF（用户 2026-10-08 要求）。
+        """批量下载实验笔记 PDF（用户 2026-10-07 要求）。
 
         接口取自线上前端「下载」按钮：`report-api/report_paper/<选课记录 id>`。
         """
@@ -1465,7 +1465,7 @@ class GrabPanel(QDialog):
         self._paper_worker.start()
 
     def _on_papers_done(self, results: list) -> None:
-        """下载收尾：如实报成功/失败，成功就打开目录（用户 2026-10-08）。"""
+        """下载收尾：如实报成功/失败，成功就打开目录（用户 2026-10-07）。"""
         self.btn_download.setEnabled(True)
         ok = [result for _item, result in results if getattr(result, "ok", False)]
         bad = [(item, result) for item, result in results if not getattr(result, "ok", False)]
@@ -1621,7 +1621,7 @@ class GrabPanel(QDialog):
         viewport_h = scroll.viewport().height()
         expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
                f"内容 {content_h}px > 视口 {viewport_h}px")
-        # ── 「关于」按钮（用户 2026-10-08 要求：加个关于小按钮）──
+        # ── 「关于」按钮（用户 2026-10-07 要求：加个关于小按钮）──
         expect("有『关于』小按钮",
                self.btn_about is not None and self.btn_about.text() == "关于",
                self.btn_about.text() if self.btn_about else "无")
@@ -1650,7 +1650,7 @@ class GrabPanel(QDialog):
                 duplicates.append(f"{module_path.name}:{repeated}")
         expect("包内没有重复定义的顶层函数", not duplicates, str(duplicates))
 
-        # ── 下载实验笔记（用户 2026-10-08 新增功能）──
+        # ── 下载实验笔记（用户 2026-10-07 新增功能）──
         expect("默认下载到『下载』文件夹下的子目录（不是 AppData）",
                "Downloads" in str(app_config.notes_dir())
                or str(app_config.notes_dir()).startswith(str(app_config.downloads_dir())),
@@ -1679,7 +1679,7 @@ class GrabPanel(QDialog):
                not set(naive_name) & set('\\/:*?"<>|') and naive_name.endswith(".pdf"),
                naive_name)
 
-        # ── 「停止」必须真的能停（用户 2026-10-08 实测报的 bug：点了还继续重试/提交）──
+        # ── 「停止」必须真的能停（用户 2026-10-07 实测报的 bug：点了还继续重试/提交）──
         # 根因：取消标志只在导入期等待循环里被检查，引擎的重试循环完全不看它。
         class _RecordingEngine:
             def __init__(self) -> None:
@@ -1710,7 +1710,7 @@ class GrabPanel(QDialog):
         expect("取消后『等待重试』立刻返回（不死等 3 秒）",
                interrupted is True and waited < 1.0, f"实际等了 {waited:.2f}s")
 
-        # ── 2026-10-08 用户要求的默认值与设置区 ──
+        # ── 2026-10-07 用户要求的默认值与设置区 ──
         expect("默认是真实提交（不是演练）", GrabPlan().dry_run is False,
                f"GrabPlan().dry_run={GrabPlan().dry_run}")
         expect("默认不捡漏（已满不空等）", GrabPlan().hunt_drops is False,
@@ -1725,7 +1725,7 @@ class GrabPanel(QDialog):
                fresh.settings_summary.text()[:48])
         fresh.deleteLater()
 
-        # 左下角：**窗口内**的已选要以**列表**显示（一行一条），窗口外的不进列表（用户 2026-10-08）
+        # 左下角：**窗口内**的已选要以**列表**显示（一行一条），窗口外的不进列表（用户 2026-10-07）
         rows = [self.mine_layout.itemAt(i).widget() for i in range(self.mine_layout.count())]
         row_texts = [self._row_text(w) for w in rows if w is not None]
         today_mmdd = dt.date.today().strftime("%m-%d")
@@ -1750,7 +1750,7 @@ class GrabPanel(QDialog):
                self.mine_title.toolTip()[:70])
         expect("左下角列表高度合理（不抢结果区）", 24 <= self.mine_scroll.height() <= 120,
                f"高 {self.mine_scroll.height()}px")
-        # ── 左下角是**管理列表**：已选可勾选退课 + 待抢也在里面（用户 2026-10-08）──
+        # ── 左下角是**管理列表**：已选可勾选退课 + 待抢也在里面（用户 2026-10-07）──
         expect("左下角有已选行且带复选框", bool(self.mine_boxes)
                and isinstance(self.mine_boxes[0][0], QCheckBox),
                f"行数={len(self.mine_boxes)}")
@@ -1815,7 +1815,7 @@ class GrabPanel(QDialog):
         hp = self.build_plan_from_ui(apply_selection=False)
         expect("捡漏关时计划里也是假", hp.hunt_drops is False, str(hp.hunt_drops))
 
-        # 按钮文案必须随模式变（用户 2026-10-08 的要求，防回归）
+        # 按钮文案必须随模式变（用户 2026-10-07 的要求，防回归）
         self.time_enable.setChecked(False)
         self._refresh_start_button()
         expect("不勾时按钮写『立即抢课』", "立即" in self.btn_start.text(), self.btn_start.text())
@@ -1912,7 +1912,7 @@ class GrabPanel(QDialog):
         expect("默认宽度下网格无需横向滚动（14 天可见）", need_w <= have_w + 2,
                f"内容宽 {need_w}px > 视口宽 {have_w}px")
 
-        # ③ 日志面板必须真的在**右侧**（用户 2026-10-08 要求；按几何判定，不靠"我打算这么做"）
+        # ③ 日志面板必须真的在**右侧**（用户 2026-10-07 要求；按几何判定，不靠"我打算这么做"）
         left_pane = self.splitter.widget(0)
         left_geo, log_geo = left_pane.geometry(), self.log_box.geometry()
         expect("日志面板在内容右侧", log_geo.x() >= left_geo.x() + left_geo.width() - 2,

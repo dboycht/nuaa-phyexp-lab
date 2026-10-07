@@ -304,7 +304,7 @@ class Runner:
             if not pending:
                 self.log(f"[满足] 所有空闲时段都已覆盖，收工。")
                 return True
-            # ── 判定「剩余的是否值得再试一轮」（用户 2026-10-08 口径）──
+            # ── 判定「剩余的是否值得再试一轮」（用户 2026-10-07 口径）──
             hunt = bool(getattr(cfg, "hunt_drops", False))
             counts: dict[str, int] = {}
             for item in pending:
