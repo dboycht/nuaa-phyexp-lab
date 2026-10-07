@@ -234,7 +234,7 @@ def cell_qss(state: str) -> str:
         border: 1px solid {style.border};
         border-radius: {style.radius}px;
         color: {style.color};
-        padding: 2px;
+        padding: 1px;
         font-size: 8pt;
     }}
     QPushButton:hover {{ background: {hover}; }}
@@ -269,35 +269,35 @@ def stylesheet() -> str:
         border: 1px solid {c.border_strong};
         border-radius: 12px;
     }}
-    QLabel#h1 {{ font-size: 15pt; font-weight: bold; color: {c.primary}; }}
-    QLabel#sub {{ color: {c.text_muted}; font-size: 9pt; }}
-    QLabel#step {{ color: {c.text_muted}; font-size: 9pt; }}
+    QLabel#h1 {{ font-size: 13pt; font-weight: bold; color: {c.primary}; }}
+    QLabel#sub {{ color: {c.text_muted}; font-size: 8pt; }}
+    QLabel#step {{ color: {c.text_muted}; font-size: 8pt; }}
 
     /* 状态小标签（chip） */
     QLabel#chip {{
-        background: {c.surface_alt}; border: 1px solid {c.border}; border-radius: 9px;
-        padding: 2px 9px; color: {c.text_muted}; font-size: 9pt;
+        background: {c.surface_alt}; border: 1px solid {c.border}; border-radius: 8px;
+        padding: 1px 7px; color: {c.text_muted}; font-size: 8pt;
     }}
     QLabel#chipOk {{
-        background: {c.ok_soft}; border: 1px solid #A7D8B8; border-radius: 9px;
-        padding: 2px 9px; color: {c.ok}; font-size: 9pt;
+        background: {c.ok_soft}; border: 1px solid #A7D8B8; border-radius: 8px;
+        padding: 1px 7px; color: {c.ok}; font-size: 8pt;
     }}
     QLabel#chipWarn {{
-        background: {c.warn_soft}; border: 1px solid #F0D9A8; border-radius: 9px;
-        padding: 2px 9px; color: {c.warn}; font-size: 9pt;
+        background: {c.warn_soft}; border: 1px solid #F0D9A8; border-radius: 8px;
+        padding: 1px 7px; color: {c.warn}; font-size: 8pt;
     }}
     QLabel#chipDanger {{
-        background: {c.danger_soft}; border: 1px solid #E9B7B7; border-radius: 9px;
-        padding: 2px 9px; color: {c.danger}; font-size: 9pt;
+        background: {c.danger_soft}; border: 1px solid #E9B7B7; border-radius: 8px;
+        padding: 1px 7px; color: {c.danger}; font-size: 8pt;
     }}
 
     /* 卡片式分组 */
     QGroupBox {{
         background: {c.surface};
         border: 1px solid {c.border_strong};
-        border-radius: 10px;
-        margin-top: 14px;
-        padding: 12px 12px 10px 12px;
+        border-radius: 8px;
+        margin-top: 11px;
+        padding: 7px 8px 6px 8px;
     }}
     QGroupBox::title {{
         subcontrol-origin: margin;
@@ -312,8 +312,8 @@ def stylesheet() -> str:
     QPushButton {{
         background: {c.surface};
         border: 1px solid {c.border_strong};
-        border-radius: 8px;
-        padding: 6px 14px;
+        border-radius: 6px;
+        padding: 3px 9px;
         color: {c.text};
     }}
     QPushButton:hover {{ background: {c.surface_alt}; border-color: {c.primary}; }}
@@ -339,9 +339,9 @@ def stylesheet() -> str:
     QSpinBox, QTimeEdit, QLineEdit, QComboBox, QDateEdit {{
         background: {c.surface};
         border: 1px solid {c.border_strong};
-        border-radius: 6px;
-        padding: 4px 8px;
-        min-height: 22px;
+        border-radius: 5px;
+        padding: 2px 6px;
+        min-height: 18px;
         selection-background-color: {c.primary};
     }}
     QSpinBox:focus, QTimeEdit:focus, QLineEdit:focus {{ border-color: {c.primary}; }}
@@ -411,7 +411,7 @@ def app_icon(size: int = 64):
 def apply_theme(app) -> None:
     """把主题应用到 QApplication（字体 + QSS + 窗口图标）。幂等，可重复调用。"""
     try:
-        app.setFont(ui_font(10))
+        app.setFont(ui_font(9))
         app.setStyleSheet(stylesheet())
         icon = app_icon()
         if not icon.isNull():

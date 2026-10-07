@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSplitter,
     QSpinBox,
     QTimeEdit,
     QVBoxLayout,
@@ -245,8 +246,8 @@ class GrabPanel(QDialog):
         #:  自检与真实运行共用逻辑时，一切"需要人"的副作用都要能关掉）。
         self.suppress_dialogs = suppress_dialogs
         self.setWindowTitle("抢课面板（两周空闲时段 → 到点自动抢 → 结果可退课）")
-        self.resize(1180, 1032)
-        self.setMinimumSize(980, 640)   # 允许缩到小屏也能用（实测提醒：不留余量时最小高度会顶到 1053）
+        self.resize(1180, 860)
+        self.setMinimumSize(1040, 600)  # 左列(14 天网格) + 右列(日志 220) 的最低要求
         self.client_factory = client_factory or (lambda: __import__(
             "phyexp_lab.api", fromlist=["PhyExpClient"]).PhyExpClient(timeout=20.0))
         self.plan_cfg = plan_cfg or GrabPlan(dry_run=True)
@@ -275,15 +276,24 @@ class GrabPanel(QDialog):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 14)
-        root.setSpacing(10)
+        root.setContentsMargins(10, 8, 10, 8)
+        root.setSpacing(0)
+
+        # 两栏布局（用户 2026-10-08）：左列 = 完整工作流；右列 = 运行日志（**整列高度**）。
+        # 用 QSplitter 而不是固定网格：用户可拖动分隔条，日志也能折叠。
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        left_column = QWidget()
+        left_layout = QVBoxLayout(left_column)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
 
         # ── 顶部标题卡：标题 + 一句说明 + 状态小标签 ──
         header = QFrame()
         header.setObjectName("header")
         head_layout = QVBoxLayout(header)
-        head_layout.setContentsMargins(16, 12, 16, 12)
-        head_layout.setSpacing(6)
+        head_layout.setContentsMargins(10, 7, 10, 7)
+        head_layout.setSpacing(4)
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
         title_row.addWidget(theme.icon_label("lab", 22, theme.ACTIVE.primary))
@@ -307,18 +317,16 @@ class GrabPanel(QDialog):
         head_layout.addLayout(title_row)
 
         subtitle = QLabel(theme.muted(
-            "第 1 步：点选你空闲的时段（绿色=可约，点一下变深绿=已选）"
-            "　·　第 2 步：可设定抢课时刻，到时自动开抢"
-            "　·　第 3 步：抢完看结果，抢多了可勾选退课"))
+            "1) 点格子 = 选你的空闲时段　2) 可设定到点开抢　3) 抢完看结果、可选退课"))
         subtitle.setObjectName("step")
         head_layout.addWidget(subtitle)
-        root.addWidget(header)
+        left_layout.addWidget(header)
 
         # ── 配置卡：三组之间用竖线分隔（时刻 / 重试 / 安全），避免一堆控件糊在一起 ──
         box = QGroupBox("抢课设置")
         box.setFont(theme.ui_font(10, QFont.DemiBold))
         cfg_layout = QHBoxLayout(box)
-        cfg_layout.setSpacing(10)
+        cfg_layout.setSpacing(6)
 
         def separator() -> QFrame:
             line = QFrame()
@@ -362,11 +370,11 @@ class GrabPanel(QDialog):
         self.notify_check.setChecked(bool(self.plan_cfg.notify))
         cfg_layout.addWidget(self.notify_check)
         cfg_layout.addStretch(1)
-        root.addWidget(box)
+        left_layout.addWidget(box)
 
         # ── 操作条 ──
         actions = QHBoxLayout()
-        actions.setSpacing(8)
+        actions.setSpacing(6)
         self.btn_reload = QPushButton("刷新场次")
         self.btn_reload.setIcon(theme.qicon("refresh", 15))
         self.btn_reload.clicked.connect(self.reload)
@@ -405,13 +413,13 @@ class GrabPanel(QDialog):
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_grab)
         actions.addWidget(self.btn_stop)
-        root.addLayout(actions)
+        left_layout.addLayout(actions)
 
         # ── 网格卡 ──
         grid_box = QGroupBox("空闲时段（两周）")
         grid_box.setFont(theme.ui_font(10, QFont.DemiBold))
         grid_outer = QVBoxLayout(grid_box)
-        grid_outer.setContentsMargins(10, 8, 10, 10)
+        grid_outer.setContentsMargins(7, 5, 7, 7)
         hint = QLabel(theme.muted(
             "点格子 = 标记「这个时段我有空」（与当前有没有课无关）；"
             "格子里的小字是当前可见情况，窗口未开时大多显示「未放出」属正常。"
@@ -428,15 +436,17 @@ class GrabPanel(QDialog):
         grid_outer.addWidget(self.banner)
         self.grid_host = QWidget()
         self.grid = QGridLayout(self.grid_host)
-        self.grid.setSpacing(4)
+        self.grid.setSpacing(2)
         self.grid.setContentsMargins(2, 2, 2, 2)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.grid_host)
         grid_outer.addWidget(scroll)
-        scroll.setMinimumHeight(170)      # 允许缩小（能滚动看其余行）；窗口够大时由 stretch 自动展开
-        scroll.setMaximumHeight(560)
-        root.addWidget(grid_box, 5)
+        scroll.setMinimumHeight(150)      # 兜底：窗口很矮时可滚动
+        scroll.setMaximumHeight(520)
+
+        left_layout.addWidget(grid_box)         # 按内容自适应：多余高度**不要**塞进网格卡
+                                                # （否则网格内部会多出一大片空白，实测很难看）
 
         # ── 结果卡 ──
         self.result_box = QGroupBox("本轮结果（勾选后可退课）")
@@ -445,19 +455,18 @@ class GrabPanel(QDialog):
         result_layout.setContentsMargins(10, 8, 10, 10)
         self.result_text = QPlainTextEdit()
         self.result_text.setReadOnly(True)
-        self.result_text.setMinimumHeight(74)
-        self.result_text.setMaximumHeight(110)
+        self.result_text.setMinimumHeight(46)
+        self.result_text.setMaximumHeight(72)
         self.result_text.setPlaceholderText(
-            "还没有开始抢课。\n"
-            "先在上面的网格里点选空闲时段 → 点「开始抢课」。\n"
-            "默认是演练（不会真的提交）；勾选「真实提交」才会写进课表，届时会二次确认。")
+            "还没有开始抢课：先点选空闲时段，再点「开始抢课」。\n"
+            "默认演练（不会真的提交）；勾选「真实提交」才会写进课表。")
         result_layout.addWidget(self.result_text)
 
         # 抢到的条目：**可滚动的勾选列表**（条目多时不会挤成一行、也不会被截断）
         picks_scroll = QScrollArea()
         picks_scroll.setWidgetResizable(True)
-        picks_scroll.setMinimumHeight(40)
-        picks_scroll.setMaximumHeight(110)
+        picks_scroll.setMinimumHeight(32)
+        picks_scroll.setMaximumHeight(72)
         picks_scroll.setStyleSheet(
             f"QScrollArea {{ background: {theme.ACTIVE.surface};"
             f" border: 1px solid {theme.ACTIVE.border}; border-radius: 8px; }}")
@@ -481,7 +490,8 @@ class GrabPanel(QDialog):
         self.btn_cancel_picks.clicked.connect(self.cancel_picked)
         bottom.addWidget(self.btn_cancel_picks)
         result_layout.addLayout(bottom)
-        root.addWidget(self.result_box, 2)
+        left_layout.addWidget(self.result_box)
+        left_layout.addStretch(1)               # 左列的多余高度统一落在最底部
 
         # 日志卡：标题 + 清空按钮 + **可折叠**（小屏收起来能省 ~140px，让网格更大）
         log_box = QGroupBox("运行日志")
@@ -499,7 +509,7 @@ class GrabPanel(QDialog):
         self.log.setReadOnly(True)
         self.log.setFont(theme.monospace(9))
         self.log.setMinimumHeight(56)
-        self.log.setMaximumHeight(88)
+        # 不再设高度上限：日志现在独占右侧一列，撑满才有意义（原来限 88px 是为了竖向堆叠时省地方）
         self.btn_clear_log = QPushButton("清空日志")
         self.btn_clear_log.setIcon(theme.qicon("undo", 14))
         self.btn_clear_log.clicked.connect(self.log.clear)
@@ -507,7 +517,13 @@ class GrabPanel(QDialog):
         log_layout.addLayout(log_head)
         log_layout.addWidget(self.log)
         self.log_box = log_box
-        root.addWidget(log_box)
+        log_box.setMinimumWidth(200)
+        self.splitter.addWidget(left_column)
+        self.splitter.addWidget(log_box)
+        self.splitter.setStretchFactor(0, 1)      # 左列吃剩余空间
+        self.splitter.setStretchFactor(1, 0)
+        self.splitter.setSizes([940, 240])
+        root.addWidget(self.splitter, 1)          # 两栏填满窗口剩余高度
 
     # ── 日志 ──
 
@@ -586,6 +602,10 @@ class GrabPanel(QDialog):
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes if default_yes else QMessageBox.No)
         return answer == QMessageBox.Yes
+
+    def showEvent(self, event) -> None:  # noqa: D102 - Qt 钩子
+        super().showEvent(event)
+        QTimer.singleShot(0, self._fit_grid_height)   # 显示后再校一次（布局此时才真正结算）
 
     # ── 阶段与倒计时 ──
 
@@ -758,6 +778,11 @@ class GrabPanel(QDialog):
         for col in columns:
             self.grid.setColumnStretch(col, 1)
         self.grid.setColumnStretch(week_gap_col, 0)
+        # ⚠️ 行方向：卡里多出来的高度必须交给**末尾的空行**，否则 QGridLayout 会把它均摊到各行，
+        #    表现为周标题与日期行之间一大片空白、单元格被挤到下面（实测踩到）。
+        for row in range(2 + len(PERIODS)):
+            self.grid.setRowStretch(row, 0)
+        self.grid.setRowStretch(2 + len(PERIODS), 1)
 
         separator = QFrame()
         separator.setFrameShape(QFrame.VLine)
@@ -779,7 +804,7 @@ class GrabPanel(QDialog):
             name = QLabel(period)
             name.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             name.setStyleSheet(f"color: {theme.ACTIVE.text_muted}; font-size: 9pt;")
-            name.setMinimumWidth(84)
+            name.setMinimumWidth(70)
             self.grid.addWidget(name, row, 0)
             for index, date in enumerate(days):
                 key = (date, period)
@@ -791,14 +816,47 @@ class GrabPanel(QDialog):
                 button.setChecked(selected)
                 button.setCursor(Qt.PointingHandCursor)
                 button.setToolTip(self._button_tip(key, info, selected=selected))
-                button.setMinimumHeight(36)      # 36px：5 个节次在默认窗口里能一次看全（40px 会差 31px，需滚动）
-                button.setMinimumWidth(48)
+                button.setMinimumHeight(30)      # 紧凑：30px（36px 时整卡偏高）
+                button.setMinimumWidth(46)
                 state = "selected" if selected else self._cell_state(info)
                 button.setStyleSheet(theme.cell_qss(state))
                 button.clicked.connect(lambda _checked=False, k=key: self.toggle_cell(k))
                 self.grid.addWidget(button, row, columns[index])
                 self.buttons[key] = button
+        # ⚠️ **延后一拍**再按内容定高：在 _rebuild_grid 里立刻量，布局还没结算，
+        #    sizeHint 会取到 ~6px ⇒ 把网格压成一条（实测踩到，整块网格只剩 10px）。
+        QTimer.singleShot(0, self._fit_grid_height)
         self._update_selection_label()
+
+    def _fit_grid_height(self) -> None:
+        """把网格滚动区的高度设成**刚好等于内容高度**（上限 520）。
+
+        为什么要这样（用户 2026-10-08："又大又空"）：
+        · 交给布局自由伸缩 -> 多余的空白落在网格卡内部，看起来又大又空；
+        · 固定成小高度 -> 5 个节次看不全、被迫滚动。
+        按内容定高则两者都不会发生；内容超过上限时才出现滚动。
+        """
+        content = self.grid_host.sizeHint().height()
+        scroll = self.grid_host.parent().parent()
+        # ⚠️ 先分清"还没建网格"和"测量异常"：窗口一显示（showEvent）时数据往往还没加载完，
+        #    此时网格里一个格子都没有、sizeHint 只有几 px —— 这**不是异常**，
+        #    照常返回即可（数据到达后 _rebuild_grid 会自己再调度一次定高）。
+        #    实测踩到：把它当异常会连发 5 次重试并留下一条吓人的 warn。
+        if not self.buttons:
+            return
+        # 护栏：两周表头 + 5 行节次，内容高度不可能低于 ~100px。
+        # 取到不合理的小值时**不要应用**（宁可保持原样），否则会把网格压成一条。
+        if content < 100:
+            # 布局偶尔还没结算（实测首次延迟测量仍可能看到 ~4px）⇒ **静默重试**，
+            # 不要为此在日志里留一条吓人的 warn；只有连续失败才报出来。
+            self._fit_retries = getattr(self, "_fit_retries", 0) + 1
+            if self._fit_retries <= 4:
+                QTimer.singleShot(60, self._fit_grid_height)
+                return
+            self.log_line(f"[warn] 网格内容高度测量持续异常（{content}px），已放弃自动定高。")
+            return
+        self._fit_retries = 0
+        scroll.setFixedHeight(min(content + 4, 520))     # +4：抵消滚动区边框
 
     @staticmethod
     def _cell_state(info: dict) -> str:
@@ -813,7 +871,7 @@ class GrabPanel(QDialog):
         if state == "available":
             hint = f"余 {info.get('remaining')}"
         elif state == "full":
-            hint = "当前已满"
+            hint = "已满"      # 缩短：右侧日志占位后左列更窄，4 字会被省略号截掉
         elif state == "taken":
             hint = "已有选课"
         elif state == "all_elected":
@@ -1124,7 +1182,7 @@ class GrabPanel(QDialog):
         viewport_h = scroll.viewport().height()
         expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
                f"内容 {content_h}px > 视口 {viewport_h}px")
-        expect("结果占位区高度够放 3 行", self.result_text.height() >= 66,
+        expect("结果占位区高度够放 2 行", self.result_text.height() >= 40,
                f"高度 {self.result_text.height()}px")
 
         # ── 本轮最关键的用户要求（2026-10-07 用户纠正）──
@@ -1196,17 +1254,48 @@ class GrabPanel(QDialog):
         expect("登录态标签有明确结论",
                any(word in chip_text for word in ("有效", "已过期", "未登录", "无法解析")), chip_text)
 
-        # ② 在**最小窗口宽度**下，网格不该需要横向滚动（两周 14 天都要看得见）
-        self.resize(self.minimumSizeHint().width(), self.height())
+        # ② 在**默认窗口宽度**下，网格不该需要横向滚动（两周 14 天都要看得见）
+        #    注：日志占了右侧一列，窗口被拖得很窄时允许横向滚动（这是刻意的取舍）；
+        #    这里量的是"默认尺寸"这个承诺。
+        self.resize(1180, self.height())
         for _ in range(3):
             QApplication.processEvents()
         self.layout().activate()
         need_w = self.grid_host.sizeHint().width()
         have_w = scroll.viewport().width()
-        expect("最小宽度下网格无需横向滚动（14 天可见）", need_w <= have_w + 1,
+        expect("默认宽度下网格无需横向滚动（14 天可见）", need_w <= have_w + 2,
                f"内容宽 {need_w}px > 视口宽 {have_w}px")
 
-        # ③ 通用门禁：**没有文字被截断**的标签（按字体实际测量，不靠肉眼）
+        # ③ 日志面板必须真的在**右侧**（用户 2026-10-08 要求；按几何判定，不靠"我打算这么做"）
+        left_pane = self.splitter.widget(0)
+        left_geo, log_geo = left_pane.geometry(), self.log_box.geometry()
+        expect("日志面板在内容右侧", log_geo.x() >= left_geo.x() + left_geo.width() - 2,
+               f"内容 x={left_geo.x()}+w{left_geo.width()} vs 日志 x={log_geo.x()}")
+        expect("日志与内容并排（纵向有重叠）",
+               not (log_geo.y() >= left_geo.y() + left_geo.height()
+                    or left_geo.y() >= log_geo.y() + log_geo.height()),
+               f"内容 y={left_geo.y()}..{left_geo.y()+left_geo.height()} "
+               f"日志 y={log_geo.y()}..{log_geo.y()+log_geo.height()}")
+        expect("日志面板宽度可用", log_geo.width() >= 190, f"宽度 {log_geo.width()}px")
+        expect("日志占满右侧整列高度（顶齐、高度相当）",
+               log_geo.y() <= left_geo.y() + 4 and log_geo.height() >= left_geo.height() - 4,
+               f"日志 y={log_geo.y()} h={log_geo.height()} | 内容 y={left_geo.y()} h={left_geo.height()}")
+
+        # ④ 单元格文字不许被省略号截掉（最宽的一行要放得下）
+        elided: list[str] = []
+        for key, button in self.buttons.items():
+            text = button.text()
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if not lines:
+                continue
+            metrics = button.fontMetrics()
+            widest = max(lines, key=lambda line: metrics.horizontalAdvance(line))
+            needed = metrics.horizontalAdvance(widest) + 8      # 内边距
+            if needed > button.width():
+                elided.append(f"{key[1]}:{widest}({needed}>{button.width()})")
+        expect("单元格文字不被省略（含『未放出/无新实验/已满』）", not elided, str(elided[:4]))
+
+        # ⑤ 通用门禁：**没有文字被截断**的标签（按字体实际测量，不靠肉眼）
         #    ⚠️ 多行标签要按**最长的一行**量，不能把各行拼起来量 ——
         #    实测踩到：日期表头是两行（`10-07` + `周三`），拼起来量成 57px 会误报"截断"。
         import re as _re
@@ -1227,7 +1316,7 @@ class GrabPanel(QDialog):
                 clipped.append(f"{lines[0][:16]}({needed}>{label.width()})")
         expect("界面上没有文字被截断的标签", not clipped, str(clipped[:4]))
 
-        # ④ 拉不到数据时必须有**显式横幅**（用户 2026-10-07 提醒：拉不到时也不会显示）
+        # ⑥ 拉不到数据时必须有**显式横幅**（用户 2026-10-07 提醒：拉不到时也不会显示）
         self._show_banner("测试：当前拉取不到场次")
         expect("无数据时横幅可见", self.banner.isVisible() and self.banner.text())
         before_h = self.banner.height()
@@ -1235,7 +1324,7 @@ class GrabPanel(QDialog):
         expect("有数据时横幅隐藏", not self.banner.isVisible())
         expect("横幅高度合理（非零、不超两行）", before_h > 0, f"高度 {before_h}")
 
-        # ⑤ 界面文本**不许出现 markdown 标记**（memory/16 的规矩；这次又犯了，故做成运行时门禁）
+        # ⑦ 界面文本**不许出现 markdown 标记**（memory/16 的规矩；这次又犯了，故做成运行时门禁）
         #    按"真实可见的文本"查：标签文字 / 悬停提示 / 横幅 / 结果区；
         #    运行日志只查 `**`（api 层的错误文案里合法带反引号，属半技术性文本）。
         markdown_hits: list[str] = []
@@ -1253,7 +1342,7 @@ class GrabPanel(QDialog):
             markdown_hits.append("运行日志含 **")
         expect("界面文本不含 markdown 标记", not markdown_hits, str(markdown_hits[:4]))
 
-        # ⑥ 错误文案必须是**完整的一句话**（不许截成半句，如"请重新运行 `python"）
+        # ⑧ 错误文案必须是**完整的一句话**（不许截成半句，如"请重新运行 `python"）
         cause_401 = short_cause("ApiError: 401 未授权（PostgREST 42501）：token 可能已过期")
         expect("错误归类给完整短句", cause_401.endswith("未登录"), cause_401)
         cause_unknown = short_cause("某些奇怪的长错误" + "x" * 200)
