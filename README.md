@@ -99,7 +99,8 @@ nuaa-phyexp-lab/
    └─ 排课与放课规律.md            # 数据研究问题与方法
 ```
 
-**版本与更新日志**：当前版本 **1.0.2**（版本单一来源：`src/phyexp_lab/__init__.py` 的 `__version__`）；
+**版本与更新日志**：当前开发版本 **1.0.3**（版本单一来源：`src/phyexp_lab/__init__.py` 的 `__version__`；
+最新已发布 tag = **1.0.2**）；
 本版变更见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 隐私与合规
