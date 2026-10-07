@@ -59,6 +59,7 @@ python run.py autograb --plan-only # 自动抢课：只看计划（纯只读）
 python run.py autograb             # 自动抢课：演练（默认不发写请求，结束发桌面通知）
 python run.py autograb --real      # 自动抢课：**真实提交**（会写进课表）
 python run.py autograb --at 12:30:00 --real   # 到点（服务端时钟）自动开抢
+                                   # 抢完后会列出本轮抢到的条目，可输入序号（如 1,3）选择退课
 python run.py grab --course 71 --slot <id> --in 20   # 单目标定时提交引擎演练
 python run.py scrub <file.har>     # 脱敏 HAR：抹掉 Cookie/Authorization/密码 MD5 与敏感响应体后再分析
 python run.py stop                 # 让正在运行的 login/recon 优雅收尾（HAR 才会落盘！）

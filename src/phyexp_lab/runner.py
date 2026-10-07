@@ -46,6 +46,8 @@ class Attempt:
     http_status: int | None = None
     elapsed_ms: int | None = None
     verified: bool = False
+    #: 回读核实拿到的选课记录 id（`rest/user2projects.id`）—— 退课要用它
+    record_id: Any | None = None
 
     def describe(self) -> str:
         status = "-" if self.http_status is None else str(self.http_status)
@@ -210,8 +212,9 @@ class Runner:
                 continue
 
             # 4) 回读核实（R6）：不拿 HTTP 200 当成功
-            verified, detail = self._verify(client, semester_id, course_id, candidate)
+            verified, detail, record_id = self._verify(client, semester_id, course_id, candidate)
             attempt.verified = verified
+            attempt.record_id = record_id
             if verified:
                 self.log(f"       └ 服务端已确认：{detail}")
                 occupied[candidate.free_key] = f"本轮提交 slot={candidate.slot_id}"
@@ -255,17 +258,21 @@ class Runner:
             return 0.8
 
     def _verify(self, client: PhyExpClient, semester_id: Any, course_id: Any,
-                candidate: Candidate) -> tuple[bool, str]:
-        """回读 `rest/user2projects` 确认该场次已 `elected`（R6 的判据）。"""
+                candidate: Candidate) -> tuple[bool, str, Any | None]:
+        """回读 `rest/user2projects` 确认该场次已 `elected`（R6 的判据）。
+
+        返回 `(是否确认, 说明, 选课记录 id)` —— 记录 id 正好是**退课**要用的那个 id，
+        所以"顺手带回来"，避免用户想退课时再查一次（少一次请求、少一处口径）。
+        """
         try:
             mine = client.my_electives(semester_id, course_id)
         except ApiError as exc:
-            return False, f"回读失败：{exc}"
+            return False, f"回读失败：{exc}", None
         for record in mine:
             if str(record.get("schedule_id")) == candidate.slot_id:
                 return True, (f"user2project_id={record.get('id')} "
-                              f"status={record.get('schedule_status')}")
-        return False, "我的选课记录里没有该场次"
+                              f"status={record.get('schedule_status')}"), record.get("id")
+        return False, "我的选课记录里没有该场次", None
 
     def _relogin_or_abort(self, client: PhyExpClient, report: RunReport, reason: str) -> None:
         """token 失效时：能免登录恢复就恢复，否则**中止并通知**（绝不静默继续）。"""
@@ -297,6 +304,52 @@ class Runner:
             report.finished_at = dt.datetime.now()
         self._notify(report)
         return report
+
+    def cancel_pick(self, attempt: Attempt, *, course_id: Any | None = None) -> tuple[bool, str]:
+        """退掉刚抢到的一条（**写操作**）：先查 `user2projects.id`，再 `/cancel`，最后回读核实。"""
+        from . import planner
+
+        client = self._client_or_create()
+        record_id = attempt.record_id
+        try:
+            if record_id is None:
+                semesters = client.open_semesters()
+                if not semesters:
+                    return False, "没有开放学期，无法退课"
+                semester_id = semesters[0].get("id")
+                cid = course_id if course_id is not None else (self.cfg.course_id or None)
+                if cid is None:
+                    courses = client.my_courses(semester_id)
+                    cid = courses[0].get("id") if courses else None
+                if cid is None:
+                    return False, "拿不到课程 id，无法定位选课记录"
+                _rows, _names = planner.load_course_slots(client, cid)
+                for record in client.my_electives(semester_id, cid):
+                    if str(record.get("schedule_id")) == attempt.candidate.slot_id:
+                        record_id = record.get("id")
+                        break
+            if record_id is None:
+                return False, "在服务端找不到这条选课记录（可能已过期/已被退回）"
+
+            result = client.cancel_booking(record_id)
+            if not result.ok:
+                return False, f"退课接口返回失败：{result.message[:80]}"
+
+            # 回读核实：该场次必须从"我的选课记录"里消失
+            semesters = client.open_semesters()
+            if not semesters:
+                return True, "退课已提交，但无开放学期可复核"
+            semester_id = semesters[0].get("id")
+            cid = course_id if course_id is not None else (self.cfg.course_id or None)
+            if cid is None:
+                courses = client.my_courses(semester_id)
+                cid = courses[0].get("id") if courses else None
+            for record in client.my_electives(semester_id, cid):
+                if str(record.get("schedule_id")) == attempt.candidate.slot_id:
+                    return False, "退课已提交，但回读仍能看到该场次（按未退成功记录）"
+            return True, "服务端已确认该场次不在我的选课记录里"
+        except ApiError as exc:
+            return False, f"退课失败：{exc}"
 
     def _notify(self, report: RunReport, *, title_prefix: str = "抢课") -> None:
         """发桌面通知（A9：通知失败不影响结果）。"""

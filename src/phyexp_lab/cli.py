@@ -1010,11 +1010,65 @@ def _cmd_autograb(args: argparse.Namespace) -> int:
     except OSError as exc:
         print(f"[警告] 日志落盘失败：{exc}", file=sys.stderr)
 
+    # 6) 抢完之后的"选择退课"（用户 2026-10-07 要求：本轮抢了什么、可当场选择退）
+    if not plan_cfg.dry_run and report.succeeded and not args.no_prompt:
+        _post_run_review(engine, report, plan_cfg)
+
     if report.aborted_reason:
         return 3
     if plan_cfg.dry_run:
         return 0
     return 0 if report.succeeded else 1
+
+
+def _post_run_review(engine, report, plan_cfg) -> None:
+    """显示本轮抢到的结果，并让用户当场选择退掉其中若干（**不可逆，二次确认**）。"""
+    from . import prompt as prompt_mod
+
+    print()
+    print("=== 本轮抢到 ===")
+    for index, attempt in enumerate(report.succeeded, 1):
+        print(f"  {index}. {attempt.candidate.date} {attempt.candidate.period}  "
+              f"{attempt.candidate.project_name}  {attempt.candidate.location or '-'}  "
+              f"slot={attempt.candidate.slot_id}  user2project_id={attempt.record_id}")
+
+    if not prompt_mod.interactive_available():
+        print()
+        print("[跳过退课选择] 当前不是可交互终端（或输出被重定向）。")
+        print("        如需退课：python run.py cancel --id <user2project_id>")
+        print("        （上面每条都打印了 user2project_id）")
+        return
+
+    print()
+    print("全部保留：直接回车即可。")
+    picks = prompt_mod.ask_selection(len(report.succeeded), prompt="要退掉哪几条")
+    if picks is None:
+        print("[已放弃] 未做任何退课，全部保留。")
+        return
+    if not picks:
+        print("[已选择] 全部保留。")
+        return
+
+    print()
+    print("即将退掉：")
+    for index in picks:
+        item = report.succeeded[index]
+        print(f"  - {item.candidate.date} {item.candidate.period} "
+              f"{item.candidate.project_name}（user2project_id={item.record_id}）")
+    if not prompt_mod.confirm("确认退课？（不可撤销，但可以重新抢）"):
+        print("[已取消] 未做任何退课，全部保留。")
+        return
+
+    print()
+    print("=== 退课结果 ===")
+    for index in picks:
+        attempt = report.succeeded[index]
+        ok, detail = engine.cancel_pick(attempt)
+        mark = "✓" if ok else "✗"
+        print(f"  {mark} {attempt.candidate.date} {attempt.candidate.period} "
+              f"{attempt.candidate.project_name}：{detail}")
+    print()
+    print("如需复核：python run.py mine")
 
 
 def _target_server_epoch(at: str) -> float:
@@ -1126,6 +1180,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_autograb.add_argument("--real", action="store_true", help="真实提交（**会写进课表**；默认演练）")
     p_autograb.add_argument("--dry-run", action="store_true", help="显式演练（默认就是演练）")
     p_autograb.add_argument("--no-notify", action="store_true", help="不发桌面通知")
+    p_autograb.add_argument("--no-prompt", action="store_true",
+                            help="抢完后不询问是否退课（适合无人值守/重定向输出）")
 
     p_agc = sub.add_parser("autograb-config", help="写/查看抢课配置（真实配置进运行时目录）")
     p_agc.add_argument("--free", default=None,
