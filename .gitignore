@@ -28,6 +28,7 @@ dist/
 
 # ── 临时/编辑器 ──
 _scratch/
+_probe/
 *.log
 *.tmp
 .vscode/

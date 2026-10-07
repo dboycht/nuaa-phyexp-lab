@@ -18,11 +18,15 @@
 | ② 接口研究 | 登录方式、接口清单、参数与响应字段 | `docs/接口逆向.md` |
 | ③ 预约辅助 | 登录态复用、余量监控、按放闸时间自动提交（低频 + 限速退避） | `src/phyexp_lab/`（CLI → GUI） |
 
-> 当前处于**阶段 0：接口侦察**。已经完成的部分：
+> 当前处于**阶段 1：写操作已落地**（2026-10-07 窗口开放当天实测完成）：
 > - **前端接口侦察（已完成）**：API 基址、鉴权链路（`POST rest/rpc/login` + `localStorage.token` 的 Bearer JWT）、
->   PostgREST 数据层、29 张数据表、选课关键字段（`max_student_number` / `current_student_number` / `schedule_status`）、
->   选课与退课写接口 —— 全部记入 [`docs/接口逆向.md`](docs/接口逆向.md)，并逐条标注了**证据级别**（实测 / 源证 / 待验）。
-> - **待做**：用一次真实登录抓包，确认选课请求体与响应判据；在那之前 `api.py` 相关方法**显式抛 `NotImplementedError`**，不猜参数、不伪装成功。
+>   PostgREST 数据层、29 张数据表、选课关键字段（`max_student_number` / `current_student_number` / `schedule_status`），
+>   全部记入 [`docs/接口逆向.md`](docs/接口逆向.md)，并逐条标注了**证据级别**（实测 / 源证 / 待验）。
+> - **选课/退课/选项目写接口（已完成并实测）**：载荷从线上前端 bundle 读出并实跑验证 ——
+>   选课 `POST report-api/electives`（表单 `lesson_id` + `course_id`）、
+>   退课 `POST report-api/electives/<user2project_id>/cancel`。详见 [`docs/选课与退课.md`](docs/选课与退课.md)。
+>   ⚠️ 本系统**成功时也返回 `status:false`**，判据只看 HTTP 状态码与 `message`。
+> - **待做**：失败判据（已满/限流/重复提交）与真实退课的文案回填；预习测试链路实测（`docs/答题链路.md`）。
 
 ---
 
@@ -45,7 +49,12 @@ python run.py snapshot             # 只读采集：课程 → 实验项目 → 
 python run.py watch                # 余量监控：低频轮询关注场次（只读，样本逐轮落盘）
 python run.py gui                  # 图形界面：只读工作台（PySide6）
 python run.py clock                # 时钟对时：测出「服务端 − 本地」偏移（抢课打点依据）
-python run.py grab --slot <id> --in 20   # 抢课引擎演练（dry-run：只做定时，不发写请求）
+python run.py elect --list         # 选课：只读列出各课程「有余量」的场次（含余量/地点/是否已选）
+python run.py elect --course 71 --slot 4971   # **选课**（写操作；加 --dry-run 只演练）
+python run.py mine                 # 我的选课记录（含退课用的 user2project_id）
+python run.py cancel --id <user2project_id>   # **退课**（写操作；加 --dry-run 只演练）
+python run.py grab --course 71 --slot <id> --in 20   # 抢课引擎演练（dry-run：只定时，不发写请求）
+python run.py grab --course 71 --slot <id> --at 12:30:00 --real   # 抢课：到点真实提交（写操作）
 python run.py scrub <file.har>     # 脱敏 HAR：抹掉 Cookie/Authorization/密码 MD5 与敏感响应体后再分析
 python run.py stop                 # 让正在运行的 login/recon 优雅收尾（HAR 才会落盘！）
 python run.py logout               # 删除本地会话文件
@@ -62,7 +71,7 @@ python run.py logout               # 删除本地会话文件
 ├─ session\state.json      # Playwright storage_state（含会话 Cookie，敏感，勿外传）
 ├─ recon\*.har             # 完整 HAR（含响应体，逆向主依据）
 ├─ recon\*.jsonl           # 逐条请求摘要（已脱敏：Cookie/Authorization 只留长度）
-└─ logs\
+└─ logs\                   # watch-*.log / grab-*.jsonl / write-*.jsonl（每次写操作的流水）
 ```
 
 ## 目录结构
@@ -75,21 +84,22 @@ nuaa-phyexp-lab/
 │  ├─ config.py                  # 路径 / URL / UA / 反检测脚本
 │  ├─ session.py                 # Playwright 弹窗登录 + 会话持久化
 │  ├─ recon.py                   # 请求采集（HAR + 脱敏 JSONL）
-│  ├─ api.py                     # 接口封装（待逆向完成后实现）
+│  ├─ api.py                     # 接口封装（只读 + 选课/退课写操作，实测载荷）
 │  ├─ models.py                  # 数据模型（实验 / 时段 / 预约结果）
-│  ├─ monitor.py                 # 余量监控（待实现）
-│  ├─ grabber.py                 # 预发射提交引擎（待实现）
+│  ├─ monitor.py                 # 余量监控
+│  ├─ grabber.py                 # 预发射提交引擎（定时/预热/退避 + 真实提交注入点）
 │  └─ cli.py                     # 命令行入口
 └─ docs/
    ├─ 交付说明.md                  # ★ 交付物清单 / 已验证能力与判据 / 未完成项 / 风险边界 / 验收步骤
    ├─ 使用手册.md                  # ★ 命令速查与典型流程
+   ├─ 选课与退课.md                # ★ **写操作**实测记录：载荷、`status:false` 坑、回读核实、待验清单
    ├─ 接口逆向.md                 # 已实测事实 + 待填接口清单
    ├─ 答题链路.md                  # 实验前「预习测试」链路研究（含实验当天抓取流程）
    ├─ 选课窗口操作手册.md           # ★ 窗口开放当天的分步操作清单（含分工与检查表）
    └─ 排课与放课规律.md            # 数据研究问题与方法
 ```
 
-**版本与更新日志**：当前版本 **1.0.1**（版本单一来源：`src/phyexp_lab/__init__.py` 的 `__version__`）；
+**版本与更新日志**：当前版本 **1.0.2**（版本单一来源：`src/phyexp_lab/__init__.py` 的 `__version__`）；
 本版变更见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 隐私与合规

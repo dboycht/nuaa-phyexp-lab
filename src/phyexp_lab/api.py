@@ -1,8 +1,8 @@
-"""预约系统接口封装（**只读部分已实现**；写操作待选课窗口实测后再实现）。
+"""预约系统接口封装（只读 + **写操作**）。
 
 实现依据
 --------
-全部来自**实测**（`docs/接口逆向.md` §3.1/§3.6）：
+只读部分来自**实测**（`docs/接口逆向.md` §3.1/§3.6）：
 
 - 脚本直连可行：带 `Authorization: Bearer <jwt>` 的 `requests` GET 返回 200；
 - 稳态 RTT 中位 11ms（首次含 TLS 1250ms）⇒ 客户端**复用一个 keep-alive 会话**；
@@ -17,6 +17,14 @@
       &user2projects.user_id=eq.<user_id>&user2projects.schedule_status=in.(elected,scheduled)
   ```
 
+写操作依据（**2026-10-07 从线上前端 bundle 读出的调用点**，见 `docs/接口逆向.md` §3.4）：
+
+- 选课：`POST report-api/electives`，**表单**（`qs.stringify`）`lesson_id=<schedules.id>` + `course_id=<课程 id>`；
+- 退课：`POST report-api/electives/<user2projects.id>/cancel`；
+- 选实验项目：`POST report-api/electives/project`，表单 `course_id` + `project_id`；
+- 前端错误语义：**401** = token 失效（前端清 localStorage 跳登录）；**400** = 取 `data.message` 展示给用户；
+- 前端 axios `timeout = 5000`、`withCredentials = true` ⇒ 本项目同样带 Cookie、并按同一量级设超时。
+
 ⚠️ 身份与隐私：`user_id` / `org_id` / 姓名 / 学号 / openid 都来自**使用者本人的 token 载荷**，
 只在**内存与本地运行时目录**中使用（`%LOCALAPPDATA%\\PhyExpLab`）；**绝不写入本仓库任何文件**。
 """
@@ -26,14 +34,123 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import json
+from dataclasses import dataclass
 from typing import Any
 
 from . import config, session
-from .models import Experiment, Slot
+from .models import Experiment, Outcome, Slot
 
 
 class ApiError(RuntimeError):
     """接口层可预期失败（消息面向使用者，可直接打印）。"""
+
+
+#: 写操作里**服务端明确回话**的失败特征（命中即分类，不靠猜）。
+RATE_LIMIT_HINTS = ("频繁", "太快", "稍后", "限流", "rate limit", "too many")
+FULL_HINTS = ("已满", "人数已满", "满员", "名额已满", "no more", "full")
+
+
+def parse_write_body(body_text: str) -> dict[str, Any]:
+    """解析写接口响应体（成功/失败都是 JSON）；解析不了就返回 `{}`（如实表示"没解析出结构化信息"）。"""
+    text = (body_text or "").strip()
+    if not text:
+        return {}
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def friendly_message(body_text: str) -> str:
+    """给使用者看的提示语：能从 JSON 里取到 `message` 就只显示它，否则退回原文。
+
+    为什么：服务端**选课成功**时回的是 `{"status":false,"code":200,"message":"ok"}` ——
+    直接把整段 JSON 打印给人看既噪音大，又**容易被误读成失败**（`status:false`！）。
+    """
+    data = parse_write_body(body_text)
+    message = data.get("message")
+    if isinstance(message, str) and message.strip():
+        code = data.get("code")
+        return f"{message.strip()}（服务端 code={code}）" if code is not None else message.strip()
+    return (body_text or "").strip()
+
+
+@dataclass(frozen=True)
+class WriteResult:
+    """一次**写操作**的结果（选课/退课）。
+
+    设计要点：把「HTTP 是否成功」「服务端文案」「分类」三者**分开存**，
+    这样复盘时能区分「真的成功了」和「HTTP 200 但服务端说没成」——
+    这正是 `BookingAttempt` 里 `Outcome.UNKNOWN` 存在的理由。
+    """
+
+    action: str
+    target: str
+    http_status: int | None
+    body_text: str
+    ok: bool
+    outcome: Outcome
+    elapsed_ms: int | None = None
+    error: str | None = None
+
+    @property
+    def message(self) -> str:
+        """给使用者看的一句话（服务端 `message` 优先，其次本地错误，最后原始响应）。"""
+        if self.error:
+            return self.error
+        if self.body_text:
+            return friendly_message(self.body_text)
+        return f"HTTP {self.http_status}（空响应体）"
+
+    def describe(self) -> str:
+        status = "-" if self.http_status is None else str(self.http_status)
+        elapsed = "-" if self.elapsed_ms is None else f"{self.elapsed_ms}ms"
+        return (f"{self.action} {self.target} → {'成功' if self.ok else '未成功'} "
+                f"[{self.outcome.value}] HTTP {status} {elapsed}：{self.message[:200]}")
+
+
+def classify_write(status: int | None, body_text: str) -> tuple[bool, Outcome]:
+    """把一次写操作的**状态码 + 响应体**分类。
+
+    ⚠️ **2026-10-07 实测（务必先读）**：真实选课成功的响应是
+    `HTTP 200 {"status":false,"code":200,"message":"ok"}` ——
+    **成功时 `status` 反而是 `false`**。因此：
+    - **不要**用 `status` 字段判断成败；
+    - 真正的判据是 **HTTP 状态码 + `message` 文案**；
+    - 本函数因此只在 `message` 文案里找「满/失败/…”等特征词，绝不看 `status`。
+
+    判据（如实、不美化）：
+    - 无状态码（网络层失败）→ `UNKNOWN`；
+    - 401 → `AUTH_EXPIRED`（前端也是这个语义：清登录态跳登录页）；
+    - 429 → `RATE_LIMITED`；
+    - 其余 4xx/5xx → 文案命中「满」→ `FULL`，命中「频繁」→ `RATE_LIMITED`，否则 `REJECTED`；
+    - 2xx → 文案命中「满/失败/错误/不存在/无权」→ `REJECTED`（HTTP 装成功但服务端说没成），
+      否则 `SUCCESS`。
+    """
+    if status is None:
+        return False, Outcome.UNKNOWN
+    if status == 401:
+        return False, Outcome.AUTH_EXPIRED
+    if status == 429:
+        return False, Outcome.RATE_LIMITED
+    # 只取 message 文案做特征匹配（避免把 JSON 键名本身当成文案）
+    data = parse_write_body(body_text)
+    message = data.get("message") if isinstance(data.get("message"), str) else ""
+    text = message or (body_text or "")
+    lowered = text.lower()
+    if status >= 400:
+        if any(hint in text for hint in FULL_HINTS) or "full" in lowered:
+            return False, Outcome.FULL
+        if any(hint in text for hint in RATE_LIMIT_HINTS) or "rate limit" in lowered:
+            return False, Outcome.RATE_LIMITED
+        return False, Outcome.REJECTED
+    # 2xx
+    if any(hint in text for hint in FULL_HINTS):
+        return False, Outcome.FULL
+    if any(word in text for word in ("失败", "错误", "不存在", "无权", "已结束", "不允许")):
+        return False, Outcome.REJECTED
+    return True, Outcome.SUCCESS
 
 
 def decode_token_claims(token: str | None = None) -> dict[str, Any]:
@@ -61,7 +178,12 @@ def _pg_date(value: dt.date) -> str:
 
 
 class PhyExpClient:
-    """预约系统只读客户端：复用一条 keep-alive 会话，所有请求自动带 token。"""
+    """预约系统客户端：复用一条 keep-alive 会话，所有请求自动带 token。
+
+    只读方法失败时抛 `ApiError`（可预期、消息面向使用者）；
+    **写方法（`submit_booking` / `cancel_booking` / `select_project`）不抛异常**，
+    统一返回 `WriteResult` —— 失败是业务结果，需要被记录与重试决策。
+    """
 
     def __init__(self, base_url: str | None = None, timeout: float = 10.0) -> None:
         self.base_url = (base_url or config.API_BASE).rstrip("/")
@@ -88,6 +210,12 @@ class PhyExpClient:
             "Authorization": token,
             "Referer": config.BOOKING_ENTRY,
         })
+        # 前端 `axios.defaults.withCredentials = true`：写接口走网关，带上会话 Cookie 更贴近真实前端。
+        try:
+            for name, value in session.load_cookies().items():
+                http.cookies.set(name, value)
+        except Exception:  # noqa: BLE001 - Cookie 缺失不应阻断只读能力
+            pass
         # 连接预热：实测不预热首次要付 ~1250ms(TLS)，预热后稳态 ~11ms
         self._http = http
         self._prewarmed = False
@@ -129,6 +257,61 @@ class PhyExpClient:
             return resp.json()
         except ValueError as exc:
             raise ApiError(f"响应不是 JSON（{exc}）：{(resp.text or '')[:160]}") from exc
+
+    def _post_form(self, path: str, data: dict[str, Any] | None = None, *,
+                   action: str = "post", target: str = "") -> WriteResult:
+        """**写操作**底层：表单编码 POST，把结果如实分类（**不抛异常，返回结果对象**）。
+
+        为什么写操作不抛异常：一次写请求的"失败"是**业务结果**（已满/限流/重复），
+        调用方需要把它记录下来继续决策（退避重试等），而不是让流程中断。
+        只有网络层异常才在结果里以 `error` 字段体现。
+        """
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        started = dt.datetime.now()
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        try:
+            # 注意：requests 的 data=dict 会自动表单编码（charset utf-8），与前端 `qs.stringify` 一致
+            resp = self._http.post(url, data=(data or {}), headers=headers, timeout=self.timeout)
+        except Exception as exc:  # noqa: BLE001
+            elapsed = int((dt.datetime.now() - started).total_seconds() * 1000)
+            return WriteResult(
+                action=action, target=target, http_status=None, body_text="",
+                ok=False, outcome=Outcome.UNKNOWN, elapsed_ms=elapsed,
+                error=f"请求失败（{type(exc).__name__}）：{exc}",
+            )
+        elapsed = int((dt.datetime.now() - started).total_seconds() * 1000)
+        text = (resp.text or "").strip()
+        ok, outcome = classify_write(resp.status_code, text)
+        result = WriteResult(
+            action=action, target=target, http_status=resp.status_code,
+            body_text=text[:2000], ok=ok, outcome=outcome, elapsed_ms=elapsed,
+        )
+        self._log_write(result)
+        return result
+
+    def _log_write(self, result: WriteResult) -> None:
+        """把每次写操作追加到本地日志（**当天事后复盘的唯一依据**）。
+
+        只写本地运行时目录；不写仓库。用于区分「自以为成功」与「服务端说成功」。
+        """
+        try:
+            logs = config.logs_dir()
+            logs.mkdir(parents=True, exist_ok=True)
+            path = logs / f"write-{dt.datetime.now().strftime('%Y%m%d')}.jsonl"
+            payload = {
+                "at": dt.datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "action": result.action,
+                "target": result.target,
+                "ok": result.ok,
+                "outcome": result.outcome.value,
+                "http_status": result.http_status,
+                "elapsed_ms": result.elapsed_ms,
+                "message": (result.error or result.body_text)[:500],
+            }
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:  # noqa: BLE001 - 日志失败不能影响写操作本身的结论
+            pass
 
     # ── 只读接口 ──
 
@@ -232,19 +415,68 @@ class PhyExpClient:
             raw=row,
         )
 
-    # ── 写操作：待实现（等选课窗口实测请求体后再写，绝不猜参数）──
+    # ── 写操作（2026-10-07 依线上前端调用点实现）──
 
-    def submit_booking(self, slot_id: str) -> Any:
-        """提交预约（抢课动作本体）。"""
-        raise NotImplementedError(
-            "写操作尚未实测：需在**选课窗口开放时**抓一次真实提交（POST report-api/electives）"
-            "确认请求体与响应判据后再实现。see docs/接口逆向.md §3.4/§六。"
+    def my_electives(self, semester_id: Any, course_id: Any | None = None) -> list[dict]:
+        """我选上的**选课记录**（`rest/user2projects`），含 `id`（退课要用的 id）。
+
+        证据：前端「我的实验」页用的正是这条查询
+        （`user2projects?select=...&user_id=eq.&semester_id=eq.&schedule_status=in.(elected,scheduled)`）。
+        """
+        params: list[tuple[str, str]] = [
+            ("select", "id,schedule_id,project_id,course_id,schedule_status,created_at,"
+                       "ordernumber_of_schedule,schedules!user2project_schedule_id_fkey"
+                       "(date,periods(name,start_time,end_time),locations(name),"
+                       "projects:projects!schedule_project_id_fkey(name))"),
+            ("user_id", f"eq.{self.user_id}"),
+            ("semester_id", f"eq.{semester_id}"),
+            ("schedule_status", "in.(elected,scheduled,free_schedule)"),
+        ]
+        if course_id is not None:
+            params.append(("course_id", f"eq.{course_id}"))
+        data = self._get("rest/user2projects", params)
+        return data if isinstance(data, list) else [data]
+
+    def schedule(self, slot_id: Any) -> dict:
+        """按 id 读**单个场次**（提交前后核对余量与状态用）。"""
+        data = self._get("rest/schedules", [
+            ("select", "id,date,current_student_number,max_student_number,is_publish,"
+                       "project_id,course_id,periods(name,start_time,end_time),locations(name)"),
+            ("id", f"eq.{slot_id}"),
+        ])
+        if isinstance(data, list):
+            return data[0] if data else {}
+        return data if isinstance(data, dict) else {}
+
+    def submit_booking(self, slot_id: str, course_id: Any) -> WriteResult:
+        """**选课**：`POST report-api/electives`，表单 `lesson_id` + `course_id`。
+
+        `slot_id` 即 `schedules.id`（前端 `lesson.id`；前端把 `rest/schedules` 的行直接当 lesson 用，
+        且同一处既取 `lesson.id` 又取 `lesson.schedule_id` ⇒ 两者同为 `schedules.id`）。
+        """
+        return self._post_form(
+            config.ELECT_ENDPOINT,
+            {"lesson_id": str(slot_id), "course_id": str(course_id)},
+            action="选课", target=f"lesson_id={slot_id} course_id={course_id}",
         )
 
-    def cancel_booking(self, user2project_id: Any) -> Any:
-        """退课（`PATCH rest/user2projects?id=eq.<id>`）。"""
-        raise NotImplementedError(
-            "退课尚未实测：需在可操作窗口内抓一次 PATCH rest/user2projects 的真实请求体后再实现。"
+    def cancel_booking(self, user2project_id: Any) -> WriteResult:
+        """**退课**：`POST report-api/electives/<user2projects.id>/cancel`。
+
+        `user2project_id` 来自「我的选课记录」（`rest/user2projects.id`），**不是** `schedules.id`。
+        """
+        path = f"{config.ELECT_ENDPOINT}/{user2project_id}/cancel"
+        return self._post_form(path, None, action="退课", target=f"user2project_id={user2project_id}")
+
+    def select_project(self, project_id: Any, course_id: Any) -> WriteResult:
+        """**选实验项目**：`POST report-api/electives/project`，表单 `course_id` + `project_id`。
+
+        部分课程要求先在「选实验项目」里挑项目，才能约该项目的场次。
+        """
+        return self._post_form(
+            f"{config.ELECT_ENDPOINT}/project",
+            {"course_id": str(course_id), "project_id": str(project_id)},
+            action="选实验项目", target=f"project_id={project_id} course_id={course_id}",
         )
 
     def close(self) -> None:

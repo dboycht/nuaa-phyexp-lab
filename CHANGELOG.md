@@ -5,6 +5,72 @@
 
 ---
 
+## 1.0.2 — 2026-10-07
+
+**选课写接口落地**：从线上前端 bundle 确认了选课/退课/选项目的真实载荷，并接入 CLI 与抢课引擎。
+
+### 新增功能
+
+- **`python run.py elect`**：`--list` 只读列出各课程**有余量**的场次（含余量、地点、是否已选）；
+  给定 `--slot` + `--course` 则**真的提交选课**（`--dry-run` 可先演练）。
+  提交后会**回读服务端**核对是否真的落库，并打印退课命令 —— 不拿 HTTP 200 当成功。
+- **`python run.py cancel --id <user2project_id>`**：退课（写操作，`--dry-run` 可演练）。
+- **`python run.py mine`**：只读列出我的选课记录（含退课所需的 `user2project_id`）。
+- **抢课引擎接入真实提交**：`python run.py grab --real --course <id> --slot <id>`；
+  引擎本身未改，仅通过 `grabber.make_submit_func(client, course_id)` 注入适配器。
+
+### 接口结论（证据升级：源证 → 实测）
+
+| 动作 | 接口 | 载荷 |
+| --- | --- | --- |
+| 选课 | `POST report-api/electives` | 表单 `lesson_id=<schedules.id>` + `course_id=<课程 id>` |
+| 退课 | `POST report-api/electives/<user2projects.id>/cancel` | 无请求体 |
+| 选实验项目 | `POST report-api/electives/project` | 表单 `course_id` + `project_id` |
+
+- 三个端点在**未登录**时均返回 `401 {"message":"jwt error."}` ⇒ 路径正确**且服务端确实检查身份**。
+- `lesson_id` 即 `schedules.id`：前端把 `rest/schedules` 的行直接当 lesson 用，同一处既取
+  `lesson.id` 又取 `lesson.schedule_id`，两者同为 `schedules.id`（详见 `docs/接口逆向.md` §3.4）。
+- 前端错误语义：**401** = token 失效（清登录态跳登录）；**400** = 展示 `data.message`。
+
+### 🔴 实测踩坑：选课**成功**时服务端返回 `status: false`
+
+2026-10-07 窗口开放当天，对课程 id=71 的真实场次 `lesson_id=4971` 提交选课，服务端返回：
+
+```json
+HTTP 200  {"status":false,"code":200,"message":"ok"}
+```
+
+- **成功却 `status:false`** ⇒ **绝不能用 `status` 字段判断成败**，判据只能是 **HTTP 状态码 + `message` 文案**；
+- 前端自己也从未读过该字段（它只按 Promise resolve/reject 判断，reject 仅发生在 401/400 上）；
+- 本项目的落地：`api.classify_write()`（含该样本的回归用例）+ **提交后回读服务端核实**。
+
+**服务端侧核实（不拿 HTTP 200 当成功）**
+
+| 核实项 | 提交前 | 提交后 |
+| --- | --- | --- |
+| `rest/schedules?id=eq.4971` 的 `current_student_number` | 5 | **6**（容量 30） |
+| `rest/user2projects` 是否有该场次记录 | 无 | **有**：`schedule_status=elected`（记录 id 属个人数据，不写入公开文档） |
+
+### 工程与安全
+
+- 写操作统一返回 `api.WriteResult`（**不抛异常**）：把「HTTP 是否成功 / 服务端文案 / 结果分类」分开存，
+  失败作为**业务结果**供退避重试决策；单次写操作追加到 `%LOCALAPPDATA%\PhyExpLab\logs\write-<日期>.jsonl`。
+- `classify_write()` 覆盖 9 类情形（成功 / 满员 / 限流 / token 失效 / 拒绝 / 未知），
+  其中「HTTP 200 但服务端文案含失败」按**失败**记 —— 避免把"自以为成功"写进日志；
+  并有**真实成功样本**（`{"status":false,...,"message":"ok"}` → `success`）的回归用例。
+- 所有 HTTP 会话现在会带上会话 Cookie（对齐前端 `withCredentials = true`）。
+- 抢课引擎默认仍是 `dry_run`，真实提交必须显式 `--real`；未注入 `submit_func` 时会明确报错。
+
+### 未完成 / 已知边界
+
+- **退课成功文案未实测**：路径已由 401 探测证明正确，但当日未做真实退课（`【待验】`）。
+- **失败判据未实测**：已满 / 限流 / 重复提交同一场次 / 选课数量上限，服务端各回什么文案。
+- **重复提交是否幂等未知**：抢课引擎会重试，需要知道重复提交会不会产生两条记录。
+- **预习测试（答题）仍未抓取**：入口受时间与出勤门控 → 只能实验当天抓（`docs/答题链路.md` §五）。
+- **排课/放课规律未成结论**：样本仍不足以定论（`docs/排课与放课规律.md`）。
+
+---
+
 ## 1.0.1 — 2026-09-21
 
 首个版本：项目骨架 + 天目湖校区接口侦察 + 只读采集/监控/图形界面 + 时钟对时与抢课引擎（演练）。

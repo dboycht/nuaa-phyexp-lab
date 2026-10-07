@@ -1,14 +1,15 @@
 """抢课（提交）引擎骨架：对时 → 预热 → 精确定时 → 预发射 → 限速退避。
 
-**当前状态：定时与演练部分已实现；真实提交仍显式不可用。**
+**当前状态：定时、演练与真实提交均已接入。**
 
-为什么真实提交还不能用：写接口 `POST report-api/electives` 的**请求体与响应判据尚未实测**
-（本季选课窗口已关闭，见 `docs/接口逆向.md` §3.4/§六）。因此：
+写接口 `POST report-api/electives` 的载荷已于 **2026-10-07** 从线上前端 bundle 读出
+（表单 `lesson_id=<schedules.id>` + `course_id=<课程 id>`，见 `docs/接口逆向.md` §3.4），
+真实提交函数为 `api.PhyExpClient.submit_booking`，由 `make_submit_func` 适配注入。因此：
 
 - `run_until(..., dry_run=True)`（**默认**）只做定时与演练：走到点、打印"本应在这一毫秒发出"、
   记录实际发射偏差，但**不发任何写请求**；
-- `run_until(..., dry_run=False)` 会走到真实提交那一步并抛 `NotImplementedError` ——
-  **宁可明确报错，也不猜参数**。
+- `run_until(..., dry_run=False)` 会**真的提交**（`--real` 显式开启），
+  每次发射的 HTTP 状态与服务端文案都由引擎写入 `grab-*.jsonl`。
 
 已按本项目实测校准的要点
 ------------------------
@@ -17,6 +18,7 @@
 3. **发射偏差要可观测**：每次发射都记录"计划时刻 vs 实际时刻"的毫秒差，
    否则预发射偏移永远调不准（这也是抢课脚本最容易"自我感觉良好"的地方）。
 4. **限速退避**：默认两次提交最小间隔 800ms（沿用姊妹项目教务系统的实测下界），命中限速指数退避。
+5. ⚠️ **写操作不可逆地落在真实课表上**：引擎默认 `dry_run=True`，真实提交必须显式 `--real`。
 """
 
 from __future__ import annotations
@@ -40,6 +42,29 @@ SubmitFn = Callable[[str], BookingAttempt]
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def make_submit_func(client, course_id) -> SubmitFn:
+    """把 `api.PhyExpClient.submit_booking` 适配成引擎需要的 `SubmitFn`。
+
+    为什么要有这一层：引擎只关心「吃一个场次 id，返回一次尝试记录」，
+    而写接口需要 `(lesson_id, course_id)` —— 把课程 id 在装配处绑定掉，
+    引擎与写接口两边都不用为了对方改签名（`docs/选课窗口操作手册.md` 里的注入点如期生效）。
+    """
+
+    def submit(slot_id: str) -> BookingAttempt:
+        started = time.time()
+        result = client.submit_booking(slot_id, course_id)
+        return BookingAttempt(
+            slot_id=slot_id,
+            started_at=started,
+            message=result.message,
+            outcome=result.outcome,
+            http_status=result.http_status,
+            elapsed_ms=result.elapsed_ms,
+        )
+
+    return submit
 
 
 @dataclass
@@ -148,7 +173,8 @@ class Grabber:
         """向单个时段提交一次预约，并把结果分类。
 
         `dry_run=True` 时**不发任何写请求**，只记录一次演练（`Outcome.DRY_RUN`）；
-        `dry_run=False` 时需要外部注入 `submit_func`（写接口实测后实现），否则抛 `NotImplementedError`。
+        `dry_run=False` 时需要外部注入 `submit_func`（由 `make_submit_func` 绑定课程 id），
+        否则抛 `NotImplementedError` —— **没有注入就不提交，绝不偷偷发写请求**。
         """
         started = time.time()
         if dry_run:
@@ -158,10 +184,8 @@ class Grabber:
 
         if self.submit_func is None:
             raise NotImplementedError(
-                "真实提交尚未接入：需在**选课窗口开放时**抓一次真实提交"
-                "（POST report-api/electives）确认请求体与响应判据，"
-                "然后实现 `api.PhyExpClient.submit_booking` 并通过 Grabber(submit_func=...) 注入。"
-                "见 docs/接口逆向.md §3.4 与 docs/选课窗口操作手册.md。"
+                "真实提交尚未接入：请用 `grabber.make_submit_func(client, course_id)` 生成 "
+                "`submit_func` 并注入（CLI 的 `grab --real --course <id>` 已自动接线）。"
             )
         return self.submit_func(slot_id)
 

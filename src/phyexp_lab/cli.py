@@ -6,6 +6,11 @@
 - `status`   查看数据目录、会话状态与最近的采集文件
 - `login`    打开浏览器登录并保存会话
 - `recon`    侦察：登录 + 记录请求（HAR + 脱敏 JSONL）
+- `snapshot` 只读采集课程/实验项目/场次余量
+- `watch`    余量监控（只读）
+- `elect`    **选课**：列出可约场次 / 提交选课（写操作）/ 查看已选
+- `cancel`   **退课**：按选课记录 id 退课（写操作）
+- `grab`     抢课引擎：对时 + 精确定时 + 预发射（默认演练，`--real` 才真发）
 - `logout`   删除本地会话文件
 """
 
@@ -13,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import sys
 from pathlib import Path
 
@@ -222,7 +228,27 @@ def _cmd_grab(args: argparse.Namespace) -> int:
         min_submit_interval_ms=args.interval,
         max_attempts_per_target=args.max_attempts,
     )
-    engine = grabber.Grabber(client, cfg)
+    submit_func = None
+    if args.real:
+        course_id = args.course
+        if course_id is None:
+            # 未显式给课程 id 时，取"我的第一门课"，并把结论如实打印出来（不静默猜）
+            try:
+                semesters = client.open_semesters()
+                courses = client.my_courses(semesters[0].get("id")) if semesters else []
+            except api.ApiError as exc:
+                print(f"[错误] 读取我的课程失败：{exc}", file=sys.stderr)
+                client.close()
+                return 2
+            if not courses:
+                print("[错误] 拿不到课程 id（没有开放学期或没有课程）；请显式传 --course。", file=sys.stderr)
+                client.close()
+                return 2
+            course_id = courses[0].get("id")
+            print(f"[准备] 未指定 --course，按「我的第一门课」提交：course_id={course_id}")
+        submit_func = grabber.make_submit_func(client, course_id)
+
+    engine = grabber.Grabber(client, cfg, submit_func=submit_func)
     try:
         engine.prepare(measure_clock=not args.no_clock)
         if args.no_clock:
@@ -242,18 +268,22 @@ def _cmd_grab(args: argparse.Namespace) -> int:
         client.close()
 
     print()
-    print("[演练汇总]（dry-run 的结果**不是**成功，只说明定时链路走通了）")
+    print("[演练汇总]（dry-run 的结果**不是**成功，只说明定时链路走通了）" if not args.real
+          else "[发射汇总]（真实提交）")
     for attempt in engine.attempts:
         deviation = "-" if attempt.deviation_ms is None else f"{attempt.deviation_ms:+.1f}ms"
-        print(f"  场次 {attempt.slot_id}  结果 {attempt.outcome.value}  计划偏差 {deviation}")
+        status = "-" if attempt.http_status is None else str(attempt.http_status)
+        print(f"  场次 {attempt.slot_id}  结果 {attempt.outcome.value}  HTTP {status}  "
+              f"耗时 {attempt.elapsed_ms if attempt.elapsed_ms is not None else '-'}ms  "
+              f"计划偏差 {deviation}  {attempt.message[:80]}")
     if args.real:
-        print("[提示] 真实提交尚未实现：写接口需在选课窗口开放时实测后再接入。")
+        print("[提示] 每次写操作都已落盘到 logs\\write-*.jsonl 与 logs\\grab-*.jsonl；"
+              "请用 `python run.py mine` 复核服务端是否真的选上。")
     return 0
 
 
 def _sampler_pid_path() -> Path:
     return config.home_dir() / "sampler.pid"
-
 
 def _cmd_watch_bg(args: argparse.Namespace) -> int:
     """把采样器作为**独立进程**启动（脱离当前会话，长跑用）。
@@ -594,6 +624,203 @@ def _cmd_logout(_args: argparse.Namespace) -> int:
     return 0
 
 
+# ── 选课 / 退课（写操作，2026-10-07 起可用）──
+
+
+def _pick_semester_courses(client):
+    """取「开放学期 + 我的课程」；返回 (semester, courses)。空课程时由调用方处理。"""
+    semesters = client.open_semesters()
+    if not semesters:
+        return None, []
+    semester = semesters[0]
+    courses = client.my_courses(semester.get("id"))
+    return semester, courses
+
+
+def _cmd_elect(args: argparse.Namespace) -> int:
+    """选课：`--list` 只读列出可约场次；给定 `--slot` + `--course` 则**真的提交选课**。"""
+    from . import api
+
+    config.ensure_home()
+    try:
+        client = api.PhyExpClient(timeout=args.timeout)
+    except api.ApiError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        semester, courses = _pick_semester_courses(client)
+        if semester is None:
+            print("[警告] 当前没有开放学期 ⇒ 选课窗口很可能没开。")
+            return 0
+        if not courses:
+            print(f"[警告] 学期 id={semester.get('id')} 下没有我的课程，无法选课。")
+            return 0
+        course_ids = [str(c.get("id")) for c in courses]
+        picked = course_ids if args.course is None else [str(args.course)]
+        for cid in picked:
+            if cid not in course_ids:
+                print(f"[警告] 课程 {cid} 不在我的课程列表里（我的：{', '.join(course_ids)}）。")
+
+        # ── 只读列举 ──
+        if args.list or not args.slot:
+            print(f"开放学期        : id={semester.get('id')} {semester.get('name')} "
+                  f"({semester.get('since')} ~ {semester.get('to')})")
+            total_free = 0
+            for course in courses:
+                cid = course.get("id")
+                name = course.get("name")
+                mine = client.my_electives(semester.get("id"), cid)
+                mine_slots = {str(m.get("schedule_id")) for m in mine}
+                print()
+                print(f"课程 id={cid} 「{name}」  我的选课记录 {len(mine)} 条")
+                rows = []
+                for row in client.course_projects(cid):
+                    experiment = client.to_experiment(row)
+                    for r in client.slots(cid, project_id=experiment.experiment_id,
+                                          with_my_status=False):
+                        slot = client.to_slot(r)
+                        rows.append((experiment, slot))
+                free = [(e, s) for e, s in rows if (s.remaining or 0) > 0]
+                total_free += len(free)
+                print(f"  该项目共 {len(rows)} 个场次，其中**有余量 {len(free)} 个**：")
+                for experiment, slot in free:
+                    flag = "✅已选" if slot.slot_id in mine_slots else "  "
+                    print(f"    {flag} slot={slot.slot_id:>7}  {slot.time_text:24s} "
+                          f"{slot.location or '-':12s} {slot.taken}/{slot.capacity} "
+                          f"余 {slot.remaining}  [{experiment.name[:20]}]")
+            print()
+            print(f"合计有余量场次：{total_free} 个。")
+            print("提交选课：python run.py elect --course <课程id> --slot <场次id>")
+            return 0
+
+        # ── 真提交（写操作）──
+        course_id = args.course if args.course is not None else course_ids[0]
+        slot_id = str(args.slot)
+        print(f"[写操作] 即将提交选课：course_id={course_id} lesson_id={slot_id}")
+        before = None
+        try:
+            before = client.schedule(slot_id)
+            if before:
+                taken = before.get("current_student_number")
+                capacity = before.get("max_student_number")
+                print(f"提交前场次状态  : {before.get('date')} 已选 {taken}/{capacity}")
+        except api.ApiError as exc:
+            print(f"[警告] 提交前读场次失败（继续尝试提交）：{exc}")
+
+        if args.dry_run:
+            print("[演练] --dry-run：未发送任何写请求（去掉该参数才会真的选课）。")
+            return 0
+
+        result = client.submit_booking(slot_id, course_id)
+        print(f"[结果] {result.describe()}")
+        if result.body_text:
+            print(f"       服务端原始响应：{result.body_text[:200]}")
+            print("       ⚠️ 注意：本系统**成功时也返回 status:false**"
+                  "（实测 `HTTP 200 {\"status\":false,\"code\":200,\"message\":\"ok\"}`）"
+                  "⇒ 判据只看 HTTP 状态码与 message 文案，**不要**用 status 字段。")
+
+        # ── 服务端核实（不拿 HTTP 200 当成功）──
+        print("[核实] 回读我的选课记录……")
+        try:
+            mine = client.my_electives(semester.get("id"), course_id)
+            hit = [m for m in mine if str(m.get("schedule_id")) == slot_id]
+            if hit:
+                record = hit[0]
+                print(f"  ✅ 服务端**确实**有这条选课记录：user2project_id={record.get('id')} "
+                      f"status={record.get('schedule_status')}")
+                print(f"     退课命令：python run.py cancel --id {record.get('id')}")
+            else:
+                print(f"  ⚠️ 回读未发现该场次（我的选课记录 {len(mine)} 条）⇒ "
+                      f"请以服务端文案为准，不要当成成功。")
+            after = client.schedule(slot_id)
+            if after:
+                print(f"  余量：{before.get('current_student_number') if before else '?'} → "
+                      f"{after.get('current_student_number')}/{after.get('max_student_number')}")
+        except api.ApiError as exc:
+            print(f"  [警告] 核实失败（不影响提交本身）：{exc}")
+
+        if not result.ok:
+            print("[结论] 本次选课**未成功**；服务端文案见上，写操作日志在 "
+                  f"{config.logs_dir()}\\write-*.jsonl")
+            return 1
+        print("[结论] 本次选课成功。")
+        return 0
+    except api.ApiError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+    finally:
+        client.close()
+
+
+def _cmd_mine(args: argparse.Namespace) -> int:
+    """只读：列出我的选课记录（含退课需要的 user2project_id）。"""
+    from . import api
+
+    try:
+        client = api.PhyExpClient(timeout=args.timeout)
+    except api.ApiError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        semester, courses = _pick_semester_courses(client)
+        if semester is None:
+            print("[警告] 当前没有开放学期。")
+            return 0
+        course_ids = [str(c.get("id")) for c in courses]
+        picked = course_ids if args.course is None else [str(args.course)]
+        total = 0
+        for cid in picked:
+            mine = client.my_electives(semester.get("id"), cid)
+            name = next((c.get("name") for c in courses if str(c.get("id")) == cid), "")
+            print(f"课程 id={cid} 「{name}」 共 {len(mine)} 条选课记录：")
+            for record in mine:
+                schedule = record.get("schedules") or {}
+                periods = schedule.get("periods") or {}
+                project = (schedule.get("projects") or {}).get("name") \
+                    if isinstance(schedule.get("projects"), dict) else None
+                when = f"{schedule.get('date', '')} " \
+                       f"{periods.get('start_time', '')}-{periods.get('end_time', '')}".strip()
+                print(f"  user2project_id={record.get('id'):>7}  slot={record.get('schedule_id'):>7}  "
+                      f"{when:24s} {record.get('schedule_status', ''):10s} {project or ''}")
+                total += 1
+        print(f"合计 {total} 条。退课：python run.py cancel --id <user2project_id>")
+        return 0
+    except api.ApiError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+    finally:
+        client.close()
+
+
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    """退课：`POST report-api/electives/<user2project_id>/cancel`（**写操作**）。"""
+    from . import api
+
+    try:
+        client = api.PhyExpClient(timeout=args.timeout)
+    except api.ApiError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        record_id = str(args.id)
+        if args.dry_run:
+            print(f"[演练] --dry-run：本应退课 user2project_id={record_id}（未发送写请求）。")
+            return 0
+        print(f"[写操作] 即将退课：user2project_id={record_id}")
+        result = client.cancel_booking(record_id)
+        print(f"[结果] {result.describe()}")
+        if result.ok:
+            print("[结论] 退课成功。建议用 `python run.py mine` 复核一次。")
+            return 0
+        print(f"[结论] 退课**未成功**；日志：{config.logs_dir()}\\write-*.jsonl")
+        return 1
+    finally:
+        client.close()
+
+
 # ── 解析器 ──
 
 
@@ -619,13 +846,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--samples", nargs="*", default=None,
                            help="指定样本 JSONL 文件（默认取样本目录下全部）")
 
-    p_grab = sub.add_parser("grab", help="抢课引擎：对时 + 预热 + 精确定时 + 预发射（当前默认演练）")
+    p_elect = sub.add_parser("elect", help="选课：列出可约场次 / 提交选课（--slot 时为写操作）")
+    p_elect.add_argument("--list", action="store_true",
+                         help="只读：列出各课程有余量的场次（不加 --slot 时默认就是列清单）")
+    p_elect.add_argument("--course", default=None, help="课程 id（默认我的第一门课；提交时必填准确值）")
+    p_elect.add_argument("--slot", default=None,
+                         help="场次 id（= schedules.id = 前端 lesson_id）；给了它才会提交选课")
+    p_elect.add_argument("--dry-run", action="store_true", help="演练：只打印要做的事，不发写请求")
+    p_elect.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10）")
+
+    p_mine = sub.add_parser("mine", help="只读：列出我的选课记录（含退课用的 user2project_id）")
+    p_mine.add_argument("--course", default=None, help="课程 id（默认我的全部课程）")
+    p_mine.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10）")
+
+    p_cancel = sub.add_parser("cancel", help="退课（写操作）：按选课记录 id 退课")
+    p_cancel.add_argument("--id", required=True, help="选课记录 id（rest/user2projects.id，见 `mine`）")
+    p_cancel.add_argument("--dry-run", action="store_true", help="演练：只打印要做的事，不发写请求")
+    p_cancel.add_argument("--timeout", type=float, default=10.0, help="单次请求超时秒数（默认 10）")
+
+    p_grab = sub.add_parser("grab", help="抢课引擎：对时 + 预热 + 精确定时 + 预发射（默认演练，--real 才真发）")
     p_grab.add_argument("--slot", required=True, help="目标场次 id（可逗号分隔多个）")
     p_grab.add_argument("--at", default=None, help="服务端墙上时刻 HH:MM:SS（今天）")
     p_grab.add_argument("--in", dest="in_seconds", type=float, default=None,
                         help="从现在起多少秒后发射（演练方便；与 --at 二选一）")
     p_grab.add_argument("--real", action="store_true",
-                        help="真实提交（**目前会明确报错**：写接口未实测，禁止猜测参数）")
+                        help="**真实提交**（写操作，会真的写进你的课表；载荷已于 2026-10-07 实测确认）")
+    p_grab.add_argument("--course", default=None,
+                        help="课程 id（--real 时必需：写接口要 lesson_id + course_id 两个字段）")
     p_grab.add_argument("--pre-fire", type=int, default=50, help="预发射提前毫秒数（默认 50）")
     p_grab.add_argument("--interval", type=int, default=800, help="两次提交最小间隔毫秒（默认 800）")
     p_grab.add_argument("--max-attempts", type=int, default=5, help="最大尝试次数（默认 5）")
@@ -701,6 +948,9 @@ def main(argv: list[str] | None = None) -> int:
         "clock": _cmd_clock,
         "grab": _cmd_grab,
         "analyze": _cmd_analyze,
+        "elect": _cmd_elect,
+        "mine": _cmd_mine,
+        "cancel": _cmd_cancel,
         "stop": _cmd_stop,
         "logout": _cmd_logout,
     }
