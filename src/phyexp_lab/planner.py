@@ -52,9 +52,31 @@ class Uncovered:
 
     free: FreeSlot
     reason: str
+    #: 机器可读的原因分类（决定「值不值得重试」）：
+    #: `none`=该节次还没放课 / `full`=有场次但都满了 / `submitted_failed`=有余量但提交没成功 /
+    #: `all_elected`=只放了你已选过的实验 / `unknown`=其他
+    kind: str = "unknown"
 
     def describe(self) -> str:
         return f"{self.free.describe()} —— {self.reason}"
+
+
+#: 这些原因**总是**值得重试（还没放课 → 到点后可能才放出来；提交失败 → 重试就可能成功）
+RETRY_ALWAYS: tuple[str, ...] = ("none", "submitted_failed")
+#: 这些原因**只有开启「捡漏」时**才重试（已满 → 只能等别人退课）
+RETRY_IF_HUNT: tuple[str, ...] = ("full",)
+
+
+def retryable(kind: str, *, hunt_drops: bool = False) -> bool:
+    """该「未覆盖」原因是否值得再试一轮（纯函数，便于单测）。
+
+    用户口径（2026-10-08）：「只有【这个时间段空闲且剩余还有课但是提交失败】的情况下继续重试提交」
+    ⇒ 提交失败、还没放课都重试；**已满默认不空等**（要捡漏得显式打开开关）；
+    「只放了你已选过的实验」永远不重试（再试也抢不到）。
+    """
+    if kind in RETRY_ALWAYS:
+        return True
+    return bool(hunt_drops) and kind in RETRY_IF_HUNT
 
 
 @dataclass
@@ -215,16 +237,26 @@ def build_plan(plan_cfg: GrabPlan, *, rows: list[dict], course_id: Any,
         published = [r for r in rows
                      if str(r.get("date") or "") == free.date
                      and _period_of(r) == free.period]
+        kind = "unknown"
         if not published:
+            kind = "none"
             reason = "系统在该日期没有这个节次的场次（可能未排课/未发布）"
         elif all((_slot_remaining(r) or 0) <= 0 for r in published):
+            kind = "full"
             reason = f"该节次 {len(published)} 个场次都已满（余量 0）"
+        elif key in covered:
+            # ⚠️ **有候选但还没成功**（调用方用 occupied_as_covered=False 时会走到这里）——
+            # 必须与「只放了你已选过的实验」区分开：这两种情况的重试价值完全相反。
+            # 实测教训：原来只按"有没有非满场次"判断，把"提交失败"错判成"没得选"，导致不再重试。
+            kind = "submitted_failed"
+            reason = "该时段有可用候选，但这次没提交成功（见上方失败明细）"
         else:
+            kind = "all_elected"
             names_blocked = sorted({project_names.get(str(r.get("project_id") or ""),
                                                        f"项目 {r.get('project_id')}")
                                     for r in published})
             reason = "该节次只放了这些实验，你都已选过：" + "、".join(names_blocked)
-        plan.uncovered.append(Uncovered(free=free, reason=reason))
+        plan.uncovered.append(Uncovered(free=free, reason=reason, kind=kind))
 
     return plan
 

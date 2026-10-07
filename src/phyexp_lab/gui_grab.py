@@ -250,7 +250,10 @@ class GrabPanel(QDialog):
         self.setMinimumSize(1040, 600)  # 左列(14 天网格) + 右列(日志 220) 的最低要求
         self.client_factory = client_factory or (lambda: __import__(
             "phyexp_lab.api", fromlist=["PhyExpClient"]).PhyExpClient(timeout=20.0))
-        self.plan_cfg = plan_cfg or GrabPlan(dry_run=True)
+        # ⚠️ 这里**不要**再硬编码 dry_run=True（旧的安全默认）：用户 2026-10-08 明确要求
+        #    「默认的是真实提交，不是演示模式」⇒ 用 GrabPlan 的当前默认值（dry_run=False）。
+        #    想演练就在「设置」里勾演练模式（或给 GrabPanel 传 plan_cfg）。
+        self.plan_cfg = plan_cfg or GrabPlan()
         self.cells: dict[tuple[str, str], dict] = {}
         self.buttons: dict[tuple[str, str], QPushButton] = {}
         self.selected: set[tuple[str, str]] = set()
@@ -307,7 +310,10 @@ class GrabPanel(QDialog):
         self.chip_course.setObjectName("chip")
         self.chip_window = QLabel("窗口：—")
         self.chip_window.setObjectName("chip")
-        for chip in (self.chip_login, self.chip_course, self.chip_window):
+        # 提交方式（安全相关）也放一个常驻标签：设置收起时也要看得见当前是哪种
+        self.chip_mode = QLabel("真实提交")
+        self.chip_mode.setObjectName("chip")
+        for chip in (self.chip_login, self.chip_mode, self.chip_course, self.chip_window):
             title_row.addWidget(chip)
         self.btn_login = QPushButton("登录")
         self.btn_login.setIcon(theme.qicon("shield", 15))
@@ -335,6 +341,7 @@ class GrabPanel(QDialog):
             line.setFixedWidth(1)
             return line
 
+        # 主行只留"何时开抢"（核心工作流），其余选项全部收进下面的「设置」区
         cfg_layout.addWidget(QLabel("目标时刻"))
         self.time_enable = QCheckBox("到点开抢")
         cfg_layout.addWidget(self.time_enable)
@@ -343,34 +350,65 @@ class GrabPanel(QDialog):
         self.time_edit.setTime(QTime(10, 0, 0))
         self.time_edit.setFixedWidth(96)
         cfg_layout.addWidget(self.time_edit)
-        cfg_layout.addSpacing(4)
+        cfg_layout.addSpacing(6)
         cfg_layout.addWidget(separator())
-        cfg_layout.addSpacing(4)
-        cfg_layout.addWidget(QLabel("重试"))
+        cfg_layout.addSpacing(6)
+        self.btn_settings = QPushButton("设置")
+        self.btn_settings.setCheckable(True)
+        self.btn_settings.setIcon(theme.qicon("settings", 15))
+        self.btn_settings.toggled.connect(self._toggle_settings)
+        cfg_layout.addWidget(self.btn_settings)
+        cfg_layout.addStretch(1)
+        left_layout.addWidget(box)
+
+        # 设置摘要（**始终可见**）：安全相关的状态（真实提交/演练）绝不允许藏在折叠里
+        self.settings_summary = QLabel("")
+        self.settings_summary.setObjectName("sub")
+        self.settings_summary.setWordWrap(True)
+        left_layout.addWidget(self.settings_summary)
+
+        # 设置区（默认折叠，保持紧凑）
+        self.settings_box = QGroupBox("设置")
+        set_layout = QHBoxLayout(self.settings_box)
+        set_layout.setSpacing(6)
+        self.dry_check = QCheckBox("演练模式（不真的提交）")
+        self.dry_check.setChecked(bool(self.plan_cfg.dry_run))
+        self.dry_check.setToolTip("勾上=只演练不写课表；不勾=真实提交（提交前仍会二次确认）")
+        set_layout.addWidget(self.dry_check)
+        set_layout.addWidget(separator())
+        set_layout.addWidget(QLabel("重试"))
         self.rounds_spin = QSpinBox()
         self.rounds_spin.setRange(1, 200)
         self.rounds_spin.setValue(int(self.plan_cfg.retry_rounds or 10))
         self.rounds_spin.setFixedWidth(72)
         self.rounds_spin.setSuffix(" 轮")
-        cfg_layout.addWidget(self.rounds_spin)
-        cfg_layout.addWidget(QLabel("每轮间隔"))
+        set_layout.addWidget(self.rounds_spin)
+        set_layout.addWidget(QLabel("每轮间隔"))
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(1, 600)
         self.interval_spin.setValue(int(self.plan_cfg.retry_interval_seconds or 30))
         self.interval_spin.setFixedWidth(80)
         self.interval_spin.setSuffix(" 秒")
-        cfg_layout.addWidget(self.interval_spin)
-        cfg_layout.addSpacing(4)
-        cfg_layout.addWidget(separator())
-        cfg_layout.addSpacing(4)
-        self.real_check = QCheckBox("真实提交（会写进课表）")
-        self.real_check.setChecked(not self.plan_cfg.dry_run)
-        cfg_layout.addWidget(self.real_check)
+        set_layout.addWidget(self.interval_spin)
+        set_layout.addWidget(separator())
+        self.hunt_check = QCheckBox("满员后继续等退课（捡漏）")
+        self.hunt_check.setChecked(bool(self.plan_cfg.hunt_drops))
+        self.hunt_check.setToolTip(
+            "不勾（默认）：该时段已经满了就不再每轮空等；\n"
+            "勾上：每轮都再看一眼，有人退课就抢（适合开抢后那几分钟）。")
+        set_layout.addWidget(self.hunt_check)
         self.notify_check = QCheckBox("桌面通知")
         self.notify_check.setChecked(bool(self.plan_cfg.notify))
-        cfg_layout.addWidget(self.notify_check)
-        cfg_layout.addStretch(1)
-        left_layout.addWidget(box)
+        set_layout.addWidget(self.notify_check)
+        set_layout.addStretch(1)
+        self.settings_box.setVisible(False)          # 默认折叠
+        left_layout.addWidget(self.settings_box)
+
+        # 任何设置变化都刷新摘要
+        for widget in (self.dry_check, self.hunt_check, self.notify_check):
+            widget.toggled.connect(self._refresh_settings_summary)
+        self.rounds_spin.valueChanged.connect(self._refresh_settings_summary)
+        self.interval_spin.valueChanged.connect(self._refresh_settings_summary)
 
         # ── 操作条 ──
         actions = QHBoxLayout()
@@ -460,15 +498,16 @@ class GrabPanel(QDialog):
         self.result_text.setMinimumHeight(46)
         self.result_text.setMaximumHeight(72)
         self.result_text.setPlaceholderText(
-            "还没有开始抢课：先点选空闲时段，再点「开始抢课」。\n"
-            "默认演练（不会真的提交）；勾选「真实提交」才会写进课表。")
+            "还没有开始抢课：先点选空闲时段，再点「立即抢课」。\n"
+            "默认真实提交（会写进课表），提交前会二次确认；只想演练请在「设置」里勾上演练模式。")
         result_layout.addWidget(self.result_text)
 
         # 抢到的条目：**可滚动的勾选列表**（条目多时不会挤成一行、也不会被截断）
         picks_scroll = QScrollArea()
         picks_scroll.setWidgetResizable(True)
         picks_scroll.setMinimumHeight(32)
-        picks_scroll.setMaximumHeight(72)
+        # 不设上限：结果卡吃掉左列剩余高度时，让"抢到的条目"列表一起变高（更有用）
+        picks_scroll.setMaximumHeight(16777215)
         picks_scroll.setStyleSheet(
             f"QScrollArea {{ background: {theme.ACTIVE.surface};"
             f" border: 1px solid {theme.ACTIVE.border}; border-radius: 8px; }}")
@@ -478,8 +517,14 @@ class GrabPanel(QDialog):
         self.picks_layout.setSpacing(2)
         self.picks_layout.addStretch(1)
         picks_scroll.setWidget(self.picks_host)
+
+        # 左下角：**课表里已有的实验**（用户 2026-10-08：把本轮的科目显示在左下角）
+        self.mine_label = QLabel("")
+        self.mine_label.setWordWrap(True)
+        self.mine_label.setObjectName("sub")
         self.picks_scroll = picks_scroll
         result_layout.addWidget(picks_scroll)
+        result_layout.addWidget(self.mine_label)   # 左下角：课表里已有的实验
 
         bottom = QHBoxLayout()
         self.picks_hint = QLabel(theme.muted("抢到的条目会列在上面，勾选后可退课"))
@@ -492,8 +537,9 @@ class GrabPanel(QDialog):
         self.btn_cancel_picks.clicked.connect(self.cancel_picked)
         bottom.addWidget(self.btn_cancel_picks)
         result_layout.addLayout(bottom)
-        left_layout.addWidget(self.result_box)
-        left_layout.addStretch(1)               # 左列的多余高度统一落在最底部
+        # 结果卡吃掉左列剩余高度（用户 2026-10-08：不要留空白垃圾区域）——
+        # 网格卡按内容自适应（内部不留空），结果卡随窗口变高，勾选列表也跟着变高。
+        left_layout.addWidget(self.result_box, 1)
 
         # 日志卡：标题 + 清空按钮 + **可折叠**（小屏收起来能省 ~140px，让网格更大）
         log_box = QGroupBox("运行日志")
@@ -526,10 +572,34 @@ class GrabPanel(QDialog):
         self.splitter.setStretchFactor(1, 0)
         self.splitter.setSizes([940, 240])
         root.addWidget(self.splitter, 1)          # 两栏填满窗口剩余高度
+        # 摘要行 + 顶部「真实提交/演练」标签：**构造时就给初值**（不等数据加载，
+        # 否则窗口刚打开时"当前是真实提交还是演练"是空的 —— 这是安全相关信息，不能空）
+        self._refresh_settings_summary()
 
     # ── 日志 ──
 
-    def _toggle_log(self, visible: bool) -> None:
+    def _toggle_settings(self, checked: bool) -> None:
+        """展开/收起设置区（默认折叠：界面紧凑，但摘要行始终说明当前设置）。"""
+        self.settings_box.setVisible(bool(checked))
+        self.btn_settings.setText("收起设置" if checked else "设置")
+
+    def _refresh_settings_summary(self, *_args) -> None:
+        """把当前设置写成**一行摘要**（始终可见），并把提交方式同步到顶部状态标签。"""
+        if self.dry_check.isChecked():
+            mode = "演练模式（不写课表）"
+            mode_kind = "chipWarn"
+        else:
+            mode = "真实提交（会写进课表）"
+            mode_kind = "chipDanger"
+        hunt = "开" if self.hunt_check.isChecked() else "关"
+        self.settings_summary.setText(
+            f"当前设置：{mode}　·　重试 {self.rounds_spin.value()} 轮 × {self.interval_spin.value()} 秒"
+            f"　·　捡漏：{hunt}　·　桌面通知：{'开' if self.notify_check.isChecked() else '关'}"
+            f"　·　（已满的时段{'会' if self.hunt_check.isChecked() else '不会'}继续空等）")
+        if self.chip_mode is not None:
+            self._set_chip(self.chip_mode, mode.split("（")[0], mode_kind)
+
+    def _toggle_log(self, *_args) -> None:
         """折叠/展开日志区（小屏时收起来，把空间让给网格）。"""
         self.log.setVisible(visible)
         self.btn_clear_log.setVisible(visible)
@@ -725,6 +795,13 @@ class GrabPanel(QDialog):
         self._set_chip(self.chip_window, f"窗口：{days[0][5:]} ~ {days[-1][5:]}（两周）")
         self.log_line(f"已加载：课程 id={payload['course_id']}，当前可见可约单元 {avail} 个，"
                       f"已有选课 {taken} 个，已选过实验 {len(payload['taken'])} 个")
+        # 左下角：课表里已有的实验（用户 2026-10-08 要求在这里能看到科目有哪些）
+        mine = dict(payload.get("taken") or {})
+        if mine:
+            self.mine_label.setText(
+                f"课表里已有的实验（{len(mine)} 个）：" + "、".join(sorted(mine.values())))
+        else:
+            self.mine_label.setText("课表里还没有实验。")
         if avail == 0:
             self.log_line("       注意：现在看不到可约单元，这在窗口未开时是正常的 ——"
                           "你照常点选空闲时段即可，到点后系统会按当时的实时余量重新筛候选。")
@@ -828,6 +905,7 @@ class GrabPanel(QDialog):
         # ⚠️ **延后一拍**再按内容定高：在 _rebuild_grid 里立刻量，布局还没结算，
         #    sizeHint 会取到 ~6px ⇒ 把网格压成一条（实测踩到，整块网格只剩 10px）。
         QTimer.singleShot(0, self._fit_grid_height)
+        self._refresh_settings_summary()      # 摘要行 + 顶部「真实提交/演练」标签的初始值
         self._update_selection_label()
 
     def _fit_grid_height(self) -> None:
@@ -968,7 +1046,8 @@ class GrabPanel(QDialog):
             priority=self.plan_cfg.priority,
             max_total=self.plan_cfg.max_total,
             skip_taken_projects=True,
-            dry_run=not self.real_check.isChecked(),
+            dry_run=self.dry_check.isChecked(),
+            hunt_drops=self.hunt_check.isChecked(),
             notify=self.notify_check.isChecked(),
             retry_rounds=int(self.rounds_spin.value()),
             retry_interval_seconds=float(self.interval_spin.value()),
@@ -1047,8 +1126,18 @@ class GrabPanel(QDialog):
         self.log_line(f"[抢课失败] {message}")
         self._critical("抢课失败", message[:500])
 
+    def _update_result_title(self, report) -> None:
+        """结果卡标题写明「本轮选中几个」（用户 2026-10-08：左下角要能看到选中的科目）。"""
+        if getattr(report, "dry_run", False):
+            self.result_box.setTitle(
+                f"本轮结果（演练：本应提交 {len(report.would_submit)} 个）")
+        else:
+            self.result_box.setTitle(
+                f"本轮选中的实验（{len(report.succeeded)} 个，勾选后可退课）")
+
     def _on_report(self, report) -> None:
         self._results = list(report.succeeded)
+        self._update_result_title(report)
         lines = report.summary_lines()
         self.result_text.setPlainText("\n".join(lines))
         self.log_line("")
@@ -1203,6 +1292,42 @@ class GrabPanel(QDialog):
         viewport_h = scroll.viewport().height()
         expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
                f"内容 {content_h}px > 视口 {viewport_h}px")
+        # ── 2026-10-08 用户要求的默认值与设置区 ──
+        expect("默认是真实提交（不是演练）", GrabPlan().dry_run is False,
+               f"GrabPlan().dry_run={GrabPlan().dry_run}")
+        expect("默认不捡漏（已满不空等）", GrabPlan().hunt_drops is False,
+               f"GrabPlan().hunt_drops={GrabPlan().hunt_drops}")
+        # 回归门禁：构造函数曾硬编码 GrabPlan(dry_run=True)，把新默认值覆盖掉（实测踩到）
+        fresh = GrabPanel(client_factory=DemoClient, auto_reload=False, suppress_dialogs=True)
+        expect("新建面板默认就是真实提交（构造函数不覆盖）",
+               fresh.plan_cfg.dry_run is False and fresh.dry_check.isChecked() is False,
+               f"dry_run={fresh.plan_cfg.dry_run} 勾选={fresh.dry_check.isChecked()}")
+        expect("新建面板摘要构造时就有初值（安全信息不许为空）",
+               bool(fresh.settings_summary.text()) and "真实提交" in fresh.settings_summary.text(),
+               fresh.settings_summary.text()[:48])
+        fresh.deleteLater()
+        expect("设置区默认折叠（保持紧凑）", not self.settings_box.isVisible())
+        expect("设置摘要始终可见且写明提交方式",
+               bool(self.settings_summary.text()) and
+               ("真实提交" in self.settings_summary.text() or "演练" in self.settings_summary.text()),
+               self.settings_summary.text()[:60])
+        expect("顶部有提交方式标签", self.chip_mode is not None)
+        # 摘要随控件变化（改成演练 -> 摘要与标签都要跟着变）
+        self.dry_check.setChecked(True)
+        self._refresh_settings_summary()
+        expect("切到演练后摘要同步", "演练" in self.settings_summary.text(),
+               self.settings_summary.text()[:40])
+        expect("切到演练后顶部标签同步", "演练" in self.chip_mode.text(), self.chip_mode.text())
+        self.dry_check.setChecked(False)
+        self._refresh_settings_summary()
+        # 捡漏开关必须真的进计划
+        self.hunt_check.setChecked(True)
+        hp = self.build_plan_from_ui(apply_selection=False)
+        expect("捡漏开关进入计划", hp.hunt_drops is True, str(hp.hunt_drops))
+        self.hunt_check.setChecked(False)
+        hp = self.build_plan_from_ui(apply_selection=False)
+        expect("捡漏关时计划里也是假", hp.hunt_drops is False, str(hp.hunt_drops))
+
         # 按钮文案必须随模式变（用户 2026-10-08 的要求，防回归）
         self.time_enable.setChecked(False)
         self._refresh_start_button()

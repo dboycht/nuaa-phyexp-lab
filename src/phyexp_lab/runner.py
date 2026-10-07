@@ -202,8 +202,11 @@ class Runner:
                 keys.update(item.free_key for item in report.would_submit)
             return keys
 
-        def update_uncovered() -> int:
-            """重算"还没拿到的空闲时段"并写明原因，返回还差几个（A5：必须如实）。"""
+        def update_uncovered() -> list[Uncovered]:
+            """重算「还没拿到的空闲时段」并写明原因 + **原因分类**（A5：必须如实）。
+
+            返回未覆盖清单（调用方据此判断「值不值得再试一轮」）。
+            """
             got = secured()
             rows_now, names_now = planner.load_course_slots(client, course_id)
             fresh = build_plan(cfg, rows=rows_now, course_id=course_id, occupied=occupied,
@@ -214,10 +217,17 @@ class Runner:
             for free in cfg.free_slots:
                 if free.key in got:
                     continue
-                reason = reason_of.get(free.key) or "该时段当时有候选，但提交未成功（见上方失败明细）"
-                pending.append(Uncovered(free=free, reason=reason))
+                kind_of = {item.free.key: item.kind for item in fresh.uncovered}
+                if free.key in reason_of:
+                    reason = reason_of[free.key]
+                    kind = kind_of.get(free.key, "unknown")
+                else:
+                    # 规划里没列出来 ⇒ 当时是有候选的，只是提交没成功 / 没被确认
+                    reason = "该时段当时有候选，但提交未成功（见上方失败明细）"
+                    kind = "submitted_failed"
+                pending.append(Uncovered(free=free, reason=reason, kind=kind))
             report.uncovered = pending
-            return len(pending)
+            return pending
 
         def run_round(round_index: int) -> bool:
             """跑一轮（重新规划 → 逐个提交/演练）。返回 True = 该收工了。"""
@@ -280,9 +290,25 @@ class Runner:
                 if index < len(candidates):
                     time.sleep(max(0.0, self._submit_interval_seconds()))
 
-            remaining = update_uncovered()
-            if remaining == 0:
+            pending = update_uncovered()
+            if not pending:
                 self.log(f"[满足] 所有空闲时段都已覆盖，收工。")
+                return True
+            # ── 判定「剩余的是否值得再试一轮」（用户 2026-10-08 口径）──
+            hunt = bool(getattr(cfg, "hunt_drops", False))
+            counts: dict[str, int] = {}
+            for item in pending:
+                counts[item.kind] = counts.get(item.kind, 0) + 1
+            label = {"none": "还没放课", "full": "已满(要等别人退课)",
+                     "submitted_failed": "提交未成功", "all_elected": "只放了你已选过的实验",
+                     "unknown": "其他原因"}
+            detail = "；".join(f"{label.get(k, k)} {v} 个" for k, v in sorted(counts.items()))
+            worth = [u for u in pending if planner.retryable(u.kind, hunt_drops=hunt)]
+            self.log(f"[重试依据] 未覆盖 {len(pending)} 个：{detail} ⇒ 可重试 {len(worth)} 个"
+                     f"（捡漏{'开' if hunt else '关'}）")
+            if not worth:
+                self.log("[收工] 剩余时段都没有可重试的余地（已满且未开捡漏 / 只放了你选过的实验），"
+                         "不再空等。")
                 return True
             if max_total and max_total > 0 and done >= max_total:
                 return True

@@ -124,8 +124,10 @@ class GrabPlan:
     max_total: int = 0
     #: 同一实验不重复选（R8）
     skip_taken_projects: bool = True
-    #: 安全默认：演练
-    dry_run: bool = True
+    #: ⚠️ **默认真实提交**（用户 2026-10-08 明确要求：「默认的是真实提交，不是演示模式」）。
+    #: 这是对原来「安全默认=演练」的**用户授权覆盖**：真实提交前仍有二次确认弹窗（默认「否」），
+    #: 想演练就把它设为 true（GUI 的「演练模式」勾选框 / CLI 的 --dry-run）。
+    dry_run: bool = False
     #: 桌面通知（D7）
     notify: bool = True
     #: 到点自动开抢的目标时刻（本地 HH:MM:SS，配合 --at 使用；None = 手动即时执行）
@@ -134,6 +136,10 @@ class GrabPlan:
     retry_rounds: int = 10
     #: 每一轮之间的间隔秒数（默认 30s：抢课窗口内足够快，又不至于高频打扰系统）
     retry_interval_seconds: float = 30.0
+    #: 抢课窗口内**已满**的时段是否继续空等（等别人退课，即「捡漏」）。
+    #: ⚠️ 默认 **False**（用户 2026-10-08：「只有该时段空闲且有课但提交失败才继续重试」）：
+    #: 已经满了就不再每轮空等；想捡漏把它打开即可。
+    hunt_drops: bool = False
     #: 提交参数（沿用已按实测校准的 grabber.GrabConfig 默认值）
     submit: dict[str, Any] = field(default_factory=dict)
 
@@ -172,6 +178,7 @@ class GrabPlan:
             "max_total": self.max_total,
             "skip_taken_projects": self.skip_taken_projects,
             "dry_run": self.dry_run,
+            "hunt_drops": self.hunt_drops,
             "notify": self.notify,
             "target_at": self.target_at,
             "retry_rounds": self.retry_rounds,
@@ -194,7 +201,9 @@ class GrabPlan:
             priority=str(raw.get("priority") or "remaining_desc"),
             max_total=int(raw.get("max_total") or 0),
             skip_taken_projects=bool(raw.get("skip_taken_projects", True)),
-            dry_run=bool(raw.get("dry_run", True)),
+            # 默认真实提交（用户 2026-10-08）：配置里没写就是 False
+            dry_run=bool(raw.get("dry_run", False)),
+            hunt_drops=bool(raw.get("hunt_drops", False)),
             notify=bool(raw.get("notify", True)),
             target_at=raw.get("target_at"),
             retry_rounds=int(raw.get("retry_rounds") or 10),
