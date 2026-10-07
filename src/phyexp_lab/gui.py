@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __version__, api, session
+from . import __version__, api, session, theme
 
 GREEN = QColor(0x18, 0x8A, 0x3E)
 RED = QColor(0xC0, 0x39, 0x2B)
@@ -198,13 +198,13 @@ class MainWindow(QMainWindow):
         token = session.load_token()
         if not token:
             self.lbl_session.setText("会话：无（请先关闭本窗口，运行 python run.py login）")
-            self.lbl_session.setStyleSheet("color:#C0392B;")
+            self.lbl_session.setStyleSheet(f"color:{theme.ACTIVE.danger};")
             return
         age = session.state_age_seconds()
         age_text = "刚刚" if age is None or age < 5 else f"{int(age)} 秒前"
         self.lbl_session.setText(
             f"会话：已保存（{age_text}） · {session.describe_token(token)}")
-        self.lbl_session.setStyleSheet("color:#188A3E;")
+        self.lbl_session.setStyleSheet(f"color:{theme.ACTIVE.ok};")
 
     def _toggle_auto(self, checked: bool) -> None:
         self.btn_auto.setText("自动刷新：开（60s）" if checked else "自动刷新：关")
@@ -331,6 +331,7 @@ class MainWindow(QMainWindow):
 def main() -> int:
     """启动 GUI。"""
     app = QApplication.instance() or QApplication([])
+    theme.apply_theme(app)          # 与抢课面板共用同一份主题（单一来源）
     window = MainWindow()
     window.show()
     # 启动后自动加载一次真实数据

@@ -23,10 +23,11 @@ import traceback
 from typing import Any, Callable
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -43,7 +44,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import QTime
 
 from . import config as app_config
-from . import grabconfig, planner, prompt as prompt_mod, runner, session
+from . import grabconfig, planner, prompt as prompt_mod, runner, session, theme
 from .grabconfig import PERIODS, FreeSlot, GrabPlan
 
 GREEN = QColor(0x18, 0x8A, 0x3E)
@@ -51,17 +52,8 @@ RED = QColor(0xC0, 0x39, 0x2B)
 GREY = QColor(0x88, 0x88, 0x88)
 AMBER = QColor(0xB5, 0x6A, 0x00)
 
-#: 每格按钮的样式（按状态）
-STYLES = {
-    "available": "QPushButton{background:#E8F5E9;border:1px solid #9CCC9C;border-radius:4px;}"
-                 "QPushButton:checked{background:#2E7D32;color:white;font-weight:bold;}",
-    "selected": "QPushButton{background:#2E7D32;color:white;font-weight:bold;"
-                "border:1px solid #1B5E20;border-radius:4px;}",
-    "full": "QPushButton{background:#FAFAFA;color:#999;border:1px solid #DDD;border-radius:4px;}",
-    "none": "QPushButton{background:#F5F5F5;color:#BBB;border:1px dashed #E0E0E0;border-radius:4px;}",
-    "taken": "QPushButton{background:#FFF8E1;color:#8D6E63;border:1px solid #FFE082;border-radius:4px;}",
-    "all_taken": "QPushButton{background:#F3E5F5;color:#7B1FA2;border:1px solid #E1BEE7;border-radius:4px;}",
-}
+#: 单元格状态 → 中文短标签（配色统一由 `theme.CELL_STYLES` 提供，这里只管文字）
+STATE_TEXT = {"full": "已满", "taken": "已选", "all_taken": "已做过", "none": "—"}
 
 
 # ── 子线程 ──
@@ -168,7 +160,7 @@ class GrabPanel(QDialog):
                  plan_cfg: GrabPlan | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("抢课面板（两周空闲时段 → 到点自动抢 → 结果可退课）")
-        self.resize(1100, 760)
+        self.resize(1180, 900)
         self.client_factory = client_factory or (lambda: __import__(
             "phyexp_lab.api", fromlist=["PhyExpClient"]).PhyExpClient(timeout=20.0))
         self.plan_cfg = plan_cfg or GrabPlan(dry_run=True)
@@ -193,33 +185,66 @@ class GrabPanel(QDialog):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(16, 14, 16, 14)
+        root.setSpacing(10)
 
-        head = QLabel("第 1 步：在下面的网格里点选你空闲的时段（绿色=可约；点一下变深绿=已选）\n"
-                      "第 2 步：设定抢课时刻（可选）→ 点「开始抢课」→ 登录后会自动等待并抢\n"
-                      "第 3 步：抢完看结果；抢多了可以勾选后「退掉勾选项」")
-        head.setWordWrap(True)
-        root.addWidget(head)
+        # ── 顶部标题卡：标题 + 一句说明 + 状态小标签 ──
+        header = QFrame()
+        header.setObjectName("header")
+        head_layout = QVBoxLayout(header)
+        head_layout.setContentsMargins(16, 12, 16, 12)
+        head_layout.setSpacing(6)
+        title_row = QHBoxLayout()
+        title_row.setSpacing(8)
+        title_row.addWidget(theme.icon_label("lab", 22, theme.ACTIVE.primary))
+        title = QLabel("抢课面板")
+        title.setObjectName("h1")
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        self.chip_login = QLabel("登录态：检查中")
+        self.chip_login.setObjectName("chip")
+        self.chip_course = QLabel("课程：—")
+        self.chip_course.setObjectName("chip")
+        self.chip_window = QLabel("窗口：—")
+        self.chip_window.setObjectName("chip")
+        for chip in (self.chip_login, self.chip_course, self.chip_window):
+            title_row.addWidget(chip)
+        head_layout.addLayout(title_row)
 
-        # 配置区
+        subtitle = QLabel(theme.muted(
+            "第 1 步：点选你空闲的时段（绿色=可约，点一下变深绿=已选）"
+            "　·　第 2 步：可设定抢课时刻，到时自动开抢"
+            "　·　第 3 步：抢完看结果，抢多了可勾选退课"))
+        subtitle.setObjectName("step")
+        head_layout.addWidget(subtitle)
+        root.addWidget(header)
+
+        # ── 配置卡 ──
         box = QGroupBox("抢课设置")
+        box.setFont(theme.ui_font(10, QFont.DemiBold))
         cfg_layout = QHBoxLayout(box)
-        cfg_layout.addWidget(QLabel("抢课时刻："))
+        cfg_layout.setSpacing(10)
         self.time_enable = QCheckBox("到点开抢")
         cfg_layout.addWidget(self.time_enable)
         self.time_edit = QTimeEdit()
         self.time_edit.setDisplayFormat("HH:mm:ss")
         self.time_edit.setTime(QTime(10, 0, 0))
+        self.time_edit.setFixedWidth(96)
         cfg_layout.addWidget(self.time_edit)
-        cfg_layout.addWidget(QLabel("重试轮数："))
+        cfg_layout.addSpacing(8)
+        cfg_layout.addWidget(QLabel("重试轮数"))
         self.rounds_spin = QSpinBox()
         self.rounds_spin.setRange(1, 200)
         self.rounds_spin.setValue(int(self.plan_cfg.retry_rounds or 10))
+        self.rounds_spin.setFixedWidth(72)
         cfg_layout.addWidget(self.rounds_spin)
-        cfg_layout.addWidget(QLabel("每轮间隔(秒)："))
+        cfg_layout.addWidget(QLabel("每轮间隔(秒)"))
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(1, 600)
         self.interval_spin.setValue(int(self.plan_cfg.retry_interval_seconds or 30))
+        self.interval_spin.setFixedWidth(72)
         cfg_layout.addWidget(self.interval_spin)
+        cfg_layout.addSpacing(8)
         self.real_check = QCheckBox("真实提交（会写进课表）")
         self.real_check.setChecked(not self.plan_cfg.dry_run)
         cfg_layout.addWidget(self.real_check)
@@ -229,44 +254,67 @@ class GrabPanel(QDialog):
         cfg_layout.addStretch(1)
         root.addWidget(box)
 
-        # 操作按钮
+        # ── 操作条 ──
         actions = QHBoxLayout()
+        actions.setSpacing(8)
         self.btn_reload = QPushButton("刷新场次")
+        self.btn_reload.setIcon(theme.qicon("refresh", 15))
         self.btn_reload.clicked.connect(self.reload)
         actions.addWidget(self.btn_reload)
         self.btn_select_available = QPushButton("全选可约时段")
+        self.btn_select_available.setIcon(theme.qicon("check", 15))
         self.btn_select_available.clicked.connect(self.select_all_available)
         actions.addWidget(self.btn_select_available)
         self.btn_clear = QPushButton("清空选择")
+        self.btn_clear.setIcon(theme.qicon("undo", 15))
         self.btn_clear.clicked.connect(self.clear_selection)
         actions.addWidget(self.btn_clear)
         actions.addStretch(1)
         self.selection_label = QLabel("已选 0 个时段")
+        self.selection_label.setObjectName("chip")
         actions.addWidget(self.selection_label)
         self.btn_start = QPushButton("开始抢课")
+        self.btn_start.setIcon(theme.qicon("play", 15, "white"))
+        self.btn_start.setObjectName("primary")
+        self.btn_start.setMinimumWidth(120)
         self.btn_start.clicked.connect(self.start_grab)
         actions.addWidget(self.btn_start)
         self.btn_stop = QPushButton("停止")
+        self.btn_stop.setIcon(theme.qicon("stop", 15, theme.ACTIVE.danger))
+        self.btn_stop.setObjectName("danger")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_grab)
         actions.addWidget(self.btn_stop)
         root.addLayout(actions)
 
-        # 网格
+        # ── 网格卡 ──
+        grid_box = QGroupBox("空闲时段（两周）")
+        grid_box.setFont(theme.ui_font(10, QFont.DemiBold))
+        grid_outer = QVBoxLayout(grid_box)
+        grid_outer.setContentsMargins(10, 8, 10, 10)
         self.grid_host = QWidget()
         self.grid = QGridLayout(self.grid_host)
-        self.grid.setSpacing(2)
+        self.grid.setSpacing(4)
+        self.grid.setContentsMargins(2, 2, 2, 2)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.grid_host)
-        root.addWidget(scroll, 3)
+        grid_outer.addWidget(scroll)
+        scroll.setMinimumHeight(300)      # 表头 + 5 个节次一次看全（实测需要约 290px）
+        root.addWidget(grid_box, 4)
 
-        # 结果区
+        # ── 结果卡 ──
         self.result_box = QGroupBox("本轮结果（勾选后可退课）")
+        self.result_box.setFont(theme.ui_font(10, QFont.DemiBold))
         result_layout = QVBoxLayout(self.result_box)
+        result_layout.setContentsMargins(10, 8, 10, 10)
         self.result_text = QPlainTextEdit()
         self.result_text.setReadOnly(True)
-        self.result_text.setMaximumHeight(180)
+        self.result_text.setMaximumHeight(120)
+        self.result_text.setPlaceholderText(
+            "还没有开始抢课。\n"
+            "先在上面的网格里点选空闲时段 → 点「开始抢课」。\n"
+            "默认是演练（不会真的提交）；勾选「真实提交」才会写进课表，届时会二次确认。")
         result_layout.addWidget(self.result_text)
         bottom = QHBoxLayout()
         self.picks_host = QWidget()
@@ -274,6 +322,8 @@ class GrabPanel(QDialog):
         self.picks_layout.setContentsMargins(0, 0, 0, 0)
         bottom.addWidget(self.picks_host, 1)
         self.btn_cancel_picks = QPushButton("退掉勾选项")
+        self.btn_cancel_picks.setIcon(theme.qicon("delete", 15, theme.ACTIVE.danger))
+        self.btn_cancel_picks.setObjectName("danger")
         self.btn_cancel_picks.setEnabled(False)
         self.btn_cancel_picks.clicked.connect(self.cancel_picked)
         bottom.addWidget(self.btn_cancel_picks)
@@ -282,7 +332,8 @@ class GrabPanel(QDialog):
 
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(110)
+        self.log.setFont(theme.monospace(9))
+        self.log.setMaximumHeight(96)
         root.addWidget(self.log)
 
     # ── 日志 ──
@@ -306,7 +357,16 @@ class GrabPanel(QDialog):
         self._loader.finished.connect(lambda: self.btn_reload.setEnabled(True))
         self._loader.start()
 
+    def _set_chip(self, chip: QLabel, text: str, kind: str = "chip") -> None:
+        """更新状态小标签（颜色跟着状态走，不用肉眼看文字判断）。"""
+        chip.setText(text)
+        if chip.objectName() != kind:
+            chip.setObjectName(kind)
+            chip.style().unpolish(chip)      # 改了 objectName 必须重刷，否则样式不会变
+            chip.style().polish(chip)
+
     def _on_load_failed(self, message: str) -> None:
+        self._set_chip(self.chip_login, "登录态：不可用", "chipDanger")
         self.log_line(f"[加载失败] {message}")
         self.log_line("       界面保持空白（不伪造数据）；请确认已 login 且选课窗口已开。")
 
@@ -317,8 +377,25 @@ class GrabPanel(QDialog):
         self.course_label = payload
         avail = sum(1 for c in self.cells.values() if c["state"] == "available")
         taken = sum(1 for c in self.cells.values() if c["state"] == "taken")
+        # 顶部状态标签：登录态 / 课程 / 窗口
+        try:
+            token = session.load_token()
+            remain = session.describe_token(token) if token else "无 token"
+        except Exception:  # noqa: BLE001 - 状态展示失败不该影响功能
+            remain = "未知"
+        self._set_chip(self.chip_login, f"登录态：{remain[:28]}",
+                       "chipOk" if "已过期" not in remain else "chipDanger")
+        course_name = ""
+        for course in payload.get("courses") or []:
+            if str(course.get("id")) == str(payload["course_id"]):
+                course_name = str(course.get("name") or "")
+        self._set_chip(self.chip_course, f"课程：{course_name or payload['course_id']}")
+        days = self.days()
+        self._set_chip(self.chip_window, f"窗口：{days[0][5:]} ~ {days[-1][5:]}（两周）")
         self.log_line(f"已加载：课程 id={payload['course_id']}，可约单元 {avail} 个，"
                       f"已有选课 {taken} 个，已做过实验 {len(payload['taken'])} 个")
+        if avail == 0:
+            self.log_line("       提示：当前窗口内没有可约单元（可能都满了、或都做过了）。")
         # 已选时段若在新数据里不再是"可约"，要剔除（避免提交一个已经满了的场次）
         self.selected = {key for key in self.selected if self.cells.get(key, {}).get("state") == "available"}
         self._rebuild_grid()
@@ -332,16 +409,21 @@ class GrabPanel(QDialog):
         self.buttons.clear()
         days = self.days()
         weekday = "一二三四五六日"
+        today = dt.date.today().isoformat()
         for col, date in enumerate(days, start=1):
-            label = QLabel(f"{date[5:]}\n周{weekday[dt.date.fromisoformat(date).weekday()]}")
+            day = dt.date.fromisoformat(date)
+            label = QLabel(f"<b>{date[5:]}</b><br/>周{weekday[day.weekday()]}")
             label.setAlignment(Qt.AlignCenter)
-            font = label.font()
-            font.setPointSize(max(7, font.pointSize() - 1))
-            label.setFont(font)
+            label.setStyleSheet(
+                f"color: {theme.ACTIVE.primary if date == today else theme.ACTIVE.text};"
+                f"background: {theme.ACTIVE.ok_soft if date == today else 'transparent'};"
+                "border-radius: 6px; padding: 3px; font-size: 9pt;")
             self.grid.addWidget(label, 0, col)
         for row, period in enumerate(PERIODS, start=1):
             name = QLabel(period)
             name.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            name.setStyleSheet(f"color: {theme.ACTIVE.text_muted}; font-size: 9pt;")
+            name.setMinimumWidth(84)
             self.grid.addWidget(name, row, 0)
             for col, date in enumerate(days, start=1):
                 key = (date, period)
@@ -351,14 +433,15 @@ class GrabPanel(QDialog):
                 button.setCheckable(info["state"] == "available")
                 button.setChecked(key in self.selected)
                 button.setToolTip(self._button_tip(key, info))
-                button.setMinimumHeight(34)
+                button.setMinimumHeight(40)
+                button.setMinimumWidth(62)
                 if info["state"] == "available":
-                    button.setStyleSheet(STYLES["selected"] if key in self.selected
-                                         else STYLES["available"])
+                    button.setStyleSheet(theme.cell_qss(
+                        "selected" if key in self.selected else "available"))
                     button.clicked.connect(lambda _checked=False, k=key: self.toggle_cell(k))
                 else:
                     button.setEnabled(False)
-                    button.setStyleSheet(STYLES.get(info["state"], STYLES["none"]))
+                    button.setStyleSheet(theme.cell_qss(info["state"]))
                 self.grid.addWidget(button, row, col)
                 self.buttons[key] = button
         self._update_selection_label()
@@ -366,9 +449,8 @@ class GrabPanel(QDialog):
     @staticmethod
     def _button_text(info: dict) -> str:
         if info["state"] == "available":
-            return f"可约\n余{info['remaining']}"
-        return {"full": "已满", "taken": "已选", "all_taken": "已做过", "none": "—"}.get(
-            info["state"], "—")
+            return f"可约\n余 {info['remaining']}"
+        return STATE_TEXT.get(info["state"], "—")
 
     @staticmethod
     def _button_tip(key: tuple[str, str], info: dict) -> str:
@@ -390,7 +472,7 @@ class GrabPanel(QDialog):
             self.selected.add(key)
         button = self.buttons.get(key)
         if button is not None:
-            button.setStyleSheet(STYLES["selected"] if key in self.selected else STYLES["available"])
+            button.setStyleSheet(theme.cell_qss("selected" if key in self.selected else "available"))
             button.setChecked(key in self.selected)
         self._update_selection_label()
 
@@ -405,8 +487,11 @@ class GrabPanel(QDialog):
         self._rebuild_grid()
 
     def _update_selection_label(self) -> None:
-        self.selection_label.setText(f"已选 {len(self.selected)} 个时段")
-        self.btn_start.setEnabled(bool(self.selected) and not self._is_busy())
+        count = len(self.selected)
+        self.selection_label.setText(f"已选 {count} 个时段")
+        self._set_chip(self.selection_label, f"已选 {count} 个时段",
+                       "chipOk" if count else "chip")
+        self.btn_start.setEnabled(bool(count) and not self._is_busy())
 
     def selected_free_slots(self) -> list[FreeSlot]:
         return [FreeSlot(date=date, period=period) for date, period in sorted(self.selected)]
@@ -701,6 +786,7 @@ def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
     self_check = "--self-check" in args
     app = QApplication.instance() or QApplication([sys.argv[0]])
+    theme.apply_theme(app)
     if self_check:
         panel = GrabPanel(client_factory=DemoClient, plan_cfg=GrabPlan(dry_run=True, notify=False))
         # 自检模式不显示窗口，也不依赖事件循环里的定时器
