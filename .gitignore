@@ -7,6 +7,10 @@ cookies*.json
 storage_state*.json
 .env
 
+# ── 开发期探针/临时脚本（可再生产，不属于交付物）──
+_probe/
+_scratch/
+
 # ── 开发文档：只留开发副本，不同步 GitHub ──
 DEVELOPMENT.md
 ERROR.md
@@ -27,8 +31,6 @@ dist/
 .ruff_cache/
 
 # ── 临时/编辑器 ──
-_scratch/
-_probe/
 *.log
 *.tmp
 .vscode/
