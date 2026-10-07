@@ -225,6 +225,82 @@ def build_plan(plan_cfg: GrabPlan, *, rows: list[dict], course_id: Any,
     return plan
 
 
+def planned_days(start: dt.date, *, weeks: int = 2) -> list[str]:
+    """返回从 `start` 起 `weeks` 周的日期串（含 start，共 weeks*7 天）。
+
+    用户 2026-10-07 确认：日历上的"两周"**从抢课当天起算**
+    （实验在周一上午 10:00 开抢，本周与下周的场次通常一起放出来）。
+    """
+    if weeks < 1:
+        raise ValueError(f"weeks 至少为 1，实际是 {weeks}")
+    return [(start + dt.timedelta(days=offset)).isoformat() for offset in range(weeks * 7)]
+
+
+def grid_cells(plan_cfg: GrabPlan, rows: list[dict], *, days: list[str],
+               occupied: dict[tuple[str, str], str] | None = None,
+               project_names: dict[str, str] | None = None,
+               taken_projects: dict[str, str] | None = None) -> dict[tuple[str, str], dict]:
+    """把场次行整理成"网格单元"：`(日期, 节次) -> 该单元的状态`。
+
+    每个单元给出 GUI 需要的最小信息（**纯函数，便于单测**）：
+
+    - `state`: `available`（可约）/ `full`（已满）/ `none`（系统没有这个节次）/
+      `taken`（该时段已有我的选课）/ `all_taken`（该节次的实验全做过了）
+    - `remaining` / `total`：余量与场次数
+    - `best_slot_id`：余量最多的那个场次 id（点选后提交它）
+    - `project_name`：那个场次的实验名（界面提示用）
+
+    ⚠️ **只统计未做过的实验项目**（D6/R8：已选过的实验不能再选）——
+    否则界面会把"点了也会被跳过"的单元格显示成可点，属于误导。
+    若某节次的实验**全都做过**，状态给 `all_taken`，界面据此显示"已做过"并禁用。
+    """
+    occupied = dict(occupied or {})
+    project_names = dict(project_names or {})
+    taken_ids = {str(pid) for pid in (taken_projects or {})}
+    cells: dict[tuple[str, str], dict] = {}
+
+    for date in days:
+        for period in grabconfig.PERIODS:
+            key = (date, period)
+            candidates = [r for r in rows
+                          if str(r.get("date") or "") == date and _period_of(r) == period]
+            if key in occupied:
+                cells[key] = {"state": "taken", "remaining": 0, "total": len(candidates),
+                              "best_slot_id": None, "project_name": "",
+                              "reason": occupied[key]}
+                continue
+            if not candidates:
+                cells[key] = {"state": "none", "remaining": 0, "total": 0,
+                              "best_slot_id": None, "project_name": "",
+                              "reason": "系统未排该节次"}
+                continue
+            # D6/R8：已做过的实验不再出现在可选项里
+            fresh = [r for r in candidates if str(r.get("project_id") or "") not in taken_ids]
+            if not fresh:
+                cells[key] = {"state": "all_taken", "remaining": 0, "total": len(candidates),
+                              "best_slot_id": None, "project_name": "",
+                              "reason": "该节次的实验你都做过了"}
+                continue
+            usable = [r for r in fresh if (_slot_remaining(r) or 0) > 0]
+            if not usable:
+                cells[key] = {"state": "full", "remaining": 0, "total": len(candidates),
+                              "best_slot_id": None, "project_name": "",
+                              "reason": "已满"}
+                continue
+            usable.sort(key=lambda r: (-(_slot_remaining(r) or 0), str(r.get("id"))))
+            best = usable[0]
+            project_id = str(best.get("project_id") or "")
+            cells[key] = {
+                "state": "available",
+                "remaining": max((_slot_remaining(r) or 0) for r in usable),
+                "total": len(candidates),
+                "best_slot_id": str(best.get("id") or ""),
+                "project_name": project_names.get(project_id) or f"项目 {project_id}",
+                "reason": "",
+            }
+    return cells
+
+
 def _period_of(row: dict) -> str:
     periods = row.get("periods") or {}
     raw = periods.get("name") or ""

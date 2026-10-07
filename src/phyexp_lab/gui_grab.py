@@ -1,0 +1,716 @@
+"""抢课面板（PySide6）：两周网格点选空闲时段 → 定时等待 → 到点抢 → 汇报 → 可退课。
+
+对应用户 2026-10-07 口述的完整流程与 `docs/抢课规格.md`：
+「日历上点击选两周空闲时段 → 设定抢课时间段 → 登录后自动等待 → 抢到后弹出窗口汇报 → 可选择退课」。
+
+设计要点（都来自本项目已踩过的坑）
+--------------------------------
+1. **点选 = 网格按钮**，不用 `QCalendarWidget`：每个"日期 × 节次"一个按钮，
+   状态由 `planner.grid_cells()`（纯函数、已单测）决定 ⇒ 界面逻辑可被脚本验证。
+2. **网络操作全在子线程**（`Loader` 只读加载、`GrabWorker` 执行抢课），
+   主线程只更新界面 —— 不许出现"点一下卡住"。
+3. **安全默认**：勾选框默认**不勾**"真实提交"，即演练；没勾就绝不发写请求（A4）。
+4. **不可逆操作二次确认**：真实提交与退课都要先确认（默认 N）。
+5. **如实汇报**：抢到什么、没抢到什么（含原因）都写进结果区；不存在"静默跳过"。
+6. **客户端可注入**（`client_factory`）：`--self-check` 用假客户端跑一遍，
+   验证装配与状态转移，无需真实账号、无需鼠标操作。
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import traceback
+from typing import Any, Callable
+
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QTimeEdit,
+    QVBoxLayout,
+    QWidget,
+)
+from PySide6.QtCore import QTime
+
+from . import config as app_config
+from . import grabconfig, planner, prompt as prompt_mod, runner, session
+from .grabconfig import PERIODS, FreeSlot, GrabPlan
+
+GREEN = QColor(0x18, 0x8A, 0x3E)
+RED = QColor(0xC0, 0x39, 0x2B)
+GREY = QColor(0x88, 0x88, 0x88)
+AMBER = QColor(0xB5, 0x6A, 0x00)
+
+#: 每格按钮的样式（按状态）
+STYLES = {
+    "available": "QPushButton{background:#E8F5E9;border:1px solid #9CCC9C;border-radius:4px;}"
+                 "QPushButton:checked{background:#2E7D32;color:white;font-weight:bold;}",
+    "selected": "QPushButton{background:#2E7D32;color:white;font-weight:bold;"
+                "border:1px solid #1B5E20;border-radius:4px;}",
+    "full": "QPushButton{background:#FAFAFA;color:#999;border:1px solid #DDD;border-radius:4px;}",
+    "none": "QPushButton{background:#F5F5F5;color:#BBB;border:1px dashed #E0E0E0;border-radius:4px;}",
+    "taken": "QPushButton{background:#FFF8E1;color:#8D6E63;border:1px solid #FFE082;border-radius:4px;}",
+    "all_taken": "QPushButton{background:#F3E5F5;color:#7B1FA2;border:1px solid #E1BEE7;border-radius:4px;}",
+}
+
+
+# ── 子线程 ──
+
+
+class GridLoader(QThread):
+    """只读加载：两周窗口内的场次 + 我已有的选课（用于判断哪些时段已有、哪些实验做过）。"""
+
+    progress = Signal(str)
+    loaded = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, plan_cfg: GrabPlan, days: list[str], client_factory: Callable[[], Any]) -> None:
+        super().__init__()
+        self.plan_cfg = plan_cfg
+        self.days = days
+        self.client_factory = client_factory
+
+    def run(self) -> None:  # noqa: D102 - QThread 入口
+        client = None
+        try:
+            client = self.client_factory()
+            self.progress.emit("正在读取课程/场次/我的选课……")
+            semesters = client.open_semesters()
+            if not semesters:
+                self.failed.emit("当前没有开放学期（选课窗口可能没开）")
+                return
+            semester = semesters[0]
+            courses = client.my_courses(semester.get("id"))
+            if not courses:
+                self.failed.emit(f"学期 id={semester.get('id')} 下没有我的课程")
+                return
+            course_id = self.plan_cfg.course_id or courses[0].get("id")
+            rows, names = planner.load_course_slots(client, course_id)
+            occupied, taken = planner.occupied_from_electives(client, semester.get("id"), course_id)
+            cells = planner.grid_cells(self.plan_cfg, rows, days=self.days, occupied=occupied,
+                                       project_names=names, taken_projects=taken)
+            self.loaded.emit({"course_id": course_id, "courses": courses, "cells": cells,
+                              "occupied": occupied, "taken": taken,
+                              "semester": semester.get("name")})
+        except Exception as exc:  # noqa: BLE001 - 线程里必须自己兜异常
+            self.failed.emit(f"{type(exc).__name__}：{exc}\n{traceback.format_exc()[:600]}")
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+class GrabWorker(QThread):
+    """执行抢课（可选等待到点）。**真实提交由面板的勾选框控制**（默认演练）。"""
+
+    progress = Signal(str)
+    finished_report = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, plan_cfg: GrabPlan, *, wait_until_epoch: float | None,
+                 client_factory: Callable[[], Any]) -> None:
+        super().__init__()
+        self.plan_cfg = plan_cfg
+        self.wait_until_epoch = wait_until_epoch
+        self.client_factory = client_factory
+        self._cancel = False
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:  # noqa: D102 - QThread 入口
+        client = None
+        try:
+            client = self.client_factory()
+            engine = runner.Runner(self.plan_cfg, client=client, log=self.progress.emit)
+            if self.wait_until_epoch:
+                while not self._cancel:
+                    remain = self.wait_until_epoch - dt.datetime.now().timestamp()
+                    if remain <= 0.2:
+                        break
+                    self.progress.emit(f"等待到点：还剩 {int(remain)} 秒……")
+                    self.msleep(1000)
+                if self._cancel:
+                    self.progress.emit("已取消等待。")
+                    return
+            report = engine.run()
+            self.finished_report.emit(report)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(f"{type(exc).__name__}：{exc}\n{traceback.format_exc()[:600]}")
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+# ── 面板 ──
+
+
+class GrabPanel(QDialog):
+    """抢课面板。`client_factory` 可注入（自检用假客户端）。"""
+
+    def __init__(self, parent: QWidget | None = None, *,
+                 client_factory: Callable[[], Any] | None = None,
+                 plan_cfg: GrabPlan | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("抢课面板（两周空闲时段 → 到点自动抢 → 结果可退课）")
+        self.resize(1100, 760)
+        self.client_factory = client_factory or (lambda: __import__(
+            "phyexp_lab.api", fromlist=["PhyExpClient"]).PhyExpClient(timeout=20.0))
+        self.plan_cfg = plan_cfg or GrabPlan(dry_run=True)
+        self.cells: dict[tuple[str, str], dict] = {}
+        self.buttons: dict[tuple[str, str], QPushButton] = {}
+        self.selected: set[tuple[str, str]] = set()
+        self._loader: GridLoader | None = None
+        self._worker: GrabWorker | None = None
+        self._results: list = []
+
+        self._build_ui()
+        QTimer.singleShot(200, self.reload)
+
+    # ── 界面 ──
+
+    def start_date(self) -> dt.date:
+        """两周窗口的起点：**从抢课当天起算**（用户 2026-10-07 确认）。"""
+        return dt.date.today()
+
+    def days(self) -> list[str]:
+        return planner.planned_days(self.start_date(), weeks=2)
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+
+        head = QLabel("第 1 步：在下面的网格里点选你空闲的时段（绿色=可约；点一下变深绿=已选）\n"
+                      "第 2 步：设定抢课时刻（可选）→ 点「开始抢课」→ 登录后会自动等待并抢\n"
+                      "第 3 步：抢完看结果；抢多了可以勾选后「退掉勾选项」")
+        head.setWordWrap(True)
+        root.addWidget(head)
+
+        # 配置区
+        box = QGroupBox("抢课设置")
+        cfg_layout = QHBoxLayout(box)
+        cfg_layout.addWidget(QLabel("抢课时刻："))
+        self.time_enable = QCheckBox("到点开抢")
+        cfg_layout.addWidget(self.time_enable)
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat("HH:mm:ss")
+        self.time_edit.setTime(QTime(10, 0, 0))
+        cfg_layout.addWidget(self.time_edit)
+        cfg_layout.addWidget(QLabel("重试轮数："))
+        self.rounds_spin = QSpinBox()
+        self.rounds_spin.setRange(1, 200)
+        self.rounds_spin.setValue(int(self.plan_cfg.retry_rounds or 10))
+        cfg_layout.addWidget(self.rounds_spin)
+        cfg_layout.addWidget(QLabel("每轮间隔(秒)："))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 600)
+        self.interval_spin.setValue(int(self.plan_cfg.retry_interval_seconds or 30))
+        cfg_layout.addWidget(self.interval_spin)
+        self.real_check = QCheckBox("真实提交（会写进课表）")
+        self.real_check.setChecked(not self.plan_cfg.dry_run)
+        cfg_layout.addWidget(self.real_check)
+        self.notify_check = QCheckBox("桌面通知")
+        self.notify_check.setChecked(bool(self.plan_cfg.notify))
+        cfg_layout.addWidget(self.notify_check)
+        cfg_layout.addStretch(1)
+        root.addWidget(box)
+
+        # 操作按钮
+        actions = QHBoxLayout()
+        self.btn_reload = QPushButton("刷新场次")
+        self.btn_reload.clicked.connect(self.reload)
+        actions.addWidget(self.btn_reload)
+        self.btn_select_available = QPushButton("全选可约时段")
+        self.btn_select_available.clicked.connect(self.select_all_available)
+        actions.addWidget(self.btn_select_available)
+        self.btn_clear = QPushButton("清空选择")
+        self.btn_clear.clicked.connect(self.clear_selection)
+        actions.addWidget(self.btn_clear)
+        actions.addStretch(1)
+        self.selection_label = QLabel("已选 0 个时段")
+        actions.addWidget(self.selection_label)
+        self.btn_start = QPushButton("开始抢课")
+        self.btn_start.clicked.connect(self.start_grab)
+        actions.addWidget(self.btn_start)
+        self.btn_stop = QPushButton("停止")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.stop_grab)
+        actions.addWidget(self.btn_stop)
+        root.addLayout(actions)
+
+        # 网格
+        self.grid_host = QWidget()
+        self.grid = QGridLayout(self.grid_host)
+        self.grid.setSpacing(2)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.grid_host)
+        root.addWidget(scroll, 3)
+
+        # 结果区
+        self.result_box = QGroupBox("本轮结果（勾选后可退课）")
+        result_layout = QVBoxLayout(self.result_box)
+        self.result_text = QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        self.result_text.setMaximumHeight(180)
+        result_layout.addWidget(self.result_text)
+        bottom = QHBoxLayout()
+        self.picks_host = QWidget()
+        self.picks_layout = QHBoxLayout(self.picks_host)
+        self.picks_layout.setContentsMargins(0, 0, 0, 0)
+        bottom.addWidget(self.picks_host, 1)
+        self.btn_cancel_picks = QPushButton("退掉勾选项")
+        self.btn_cancel_picks.setEnabled(False)
+        self.btn_cancel_picks.clicked.connect(self.cancel_picked)
+        bottom.addWidget(self.btn_cancel_picks)
+        result_layout.addLayout(bottom)
+        root.addWidget(self.result_box, 2)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(110)
+        root.addWidget(self.log)
+
+    # ── 日志 ──
+
+    def log_line(self, text: str) -> None:
+        self.log.appendPlainText(text)
+
+    # ── 加载网格 ──
+
+    def reload(self) -> None:
+        if self._loader is not None and self._loader.isRunning():
+            self.log_line("[跳过] 上一次加载还没结束。")
+            return
+        self.btn_reload.setEnabled(False)
+        self.log_line(f"开始加载：窗口 {self.days()[0]} ~ {self.days()[-1]}（两周）")
+        self._loader = GridLoader(self.build_plan_from_ui(apply_selection=False),
+                                  self.days(), self.client_factory)
+        self._loader.progress.connect(self.log_line)
+        self._loader.loaded.connect(self._on_loaded)
+        self._loader.failed.connect(self._on_load_failed)
+        self._loader.finished.connect(lambda: self.btn_reload.setEnabled(True))
+        self._loader.start()
+
+    def _on_load_failed(self, message: str) -> None:
+        self.log_line(f"[加载失败] {message}")
+        self.log_line("       界面保持空白（不伪造数据）；请确认已 login 且选课窗口已开。")
+
+    def _on_loaded(self, payload: dict) -> None:
+        self.cells = payload["cells"]
+        if self.plan_cfg.course_id is None:
+            self.plan_cfg.course_id = payload["course_id"]
+        self.course_label = payload
+        avail = sum(1 for c in self.cells.values() if c["state"] == "available")
+        taken = sum(1 for c in self.cells.values() if c["state"] == "taken")
+        self.log_line(f"已加载：课程 id={payload['course_id']}，可约单元 {avail} 个，"
+                      f"已有选课 {taken} 个，已做过实验 {len(payload['taken'])} 个")
+        # 已选时段若在新数据里不再是"可约"，要剔除（避免提交一个已经满了的场次）
+        self.selected = {key for key in self.selected if self.cells.get(key, {}).get("state") == "available"}
+        self._rebuild_grid()
+
+    def _rebuild_grid(self) -> None:
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.buttons.clear()
+        days = self.days()
+        weekday = "一二三四五六日"
+        for col, date in enumerate(days, start=1):
+            label = QLabel(f"{date[5:]}\n周{weekday[dt.date.fromisoformat(date).weekday()]}")
+            label.setAlignment(Qt.AlignCenter)
+            font = label.font()
+            font.setPointSize(max(7, font.pointSize() - 1))
+            label.setFont(font)
+            self.grid.addWidget(label, 0, col)
+        for row, period in enumerate(PERIODS, start=1):
+            name = QLabel(period)
+            name.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.grid.addWidget(name, row, 0)
+            for col, date in enumerate(days, start=1):
+                key = (date, period)
+                info = self.cells.get(key) or {"state": "none", "remaining": 0, "total": 0,
+                                               "best_slot_id": None, "project_name": "", "reason": ""}
+                button = QPushButton(self._button_text(info))
+                button.setCheckable(info["state"] == "available")
+                button.setChecked(key in self.selected)
+                button.setToolTip(self._button_tip(key, info))
+                button.setMinimumHeight(34)
+                if info["state"] == "available":
+                    button.setStyleSheet(STYLES["selected"] if key in self.selected
+                                         else STYLES["available"])
+                    button.clicked.connect(lambda _checked=False, k=key: self.toggle_cell(k))
+                else:
+                    button.setEnabled(False)
+                    button.setStyleSheet(STYLES.get(info["state"], STYLES["none"]))
+                self.grid.addWidget(button, row, col)
+                self.buttons[key] = button
+        self._update_selection_label()
+
+    @staticmethod
+    def _button_text(info: dict) -> str:
+        if info["state"] == "available":
+            return f"可约\n余{info['remaining']}"
+        return {"full": "已满", "taken": "已选", "all_taken": "已做过", "none": "—"}.get(
+            info["state"], "—")
+
+    @staticmethod
+    def _button_tip(key: tuple[str, str], info: dict) -> str:
+        head = f"{key[0]} {key[1]}\n状态：{info['state']}"
+        if info["state"] == "available":
+            return (f"{head}\n余量 {info['remaining']}（共 {info['total']} 个场次）\n"
+                    f"实验：{info['project_name']}\n场次 id：{info['best_slot_id']}")
+        return f"{head}\n原因：{info.get('reason') or '不可选'}"
+
+    # ── 点选 ──
+
+    def toggle_cell(self, key: tuple[str, str]) -> None:
+        info = self.cells.get(key) or {}
+        if info.get("state") != "available":
+            return
+        if key in self.selected:
+            self.selected.discard(key)
+        else:
+            self.selected.add(key)
+        button = self.buttons.get(key)
+        if button is not None:
+            button.setStyleSheet(STYLES["selected"] if key in self.selected else STYLES["available"])
+            button.setChecked(key in self.selected)
+        self._update_selection_label()
+
+    def select_all_available(self) -> None:
+        for key, info in self.cells.items():
+            if info["state"] == "available" and key not in self.selected:
+                self.selected.add(key)
+        self._rebuild_grid()
+
+    def clear_selection(self) -> None:
+        self.selected.clear()
+        self._rebuild_grid()
+
+    def _update_selection_label(self) -> None:
+        self.selection_label.setText(f"已选 {len(self.selected)} 个时段")
+        self.btn_start.setEnabled(bool(self.selected) and not self._is_busy())
+
+    def selected_free_slots(self) -> list[FreeSlot]:
+        return [FreeSlot(date=date, period=period) for date, period in sorted(self.selected)]
+
+    # ── 配置装配 ──
+
+    def build_plan_from_ui(self, *, apply_selection: bool = True) -> GrabPlan:
+        plan = GrabPlan(
+            course_id=self.plan_cfg.course_id,
+            free_slots=self.selected_free_slots() if apply_selection else list(self.plan_cfg.free_slots),
+            priority=self.plan_cfg.priority,
+            max_total=self.plan_cfg.max_total,
+            skip_taken_projects=True,
+            dry_run=not self.real_check.isChecked(),
+            notify=self.notify_check.isChecked(),
+            retry_rounds=int(self.rounds_spin.value()),
+            retry_interval_seconds=float(self.interval_spin.value()),
+            submit=dict(self.plan_cfg.submit or {}),
+        )
+        return plan
+
+    def target_epoch(self) -> float | None:
+        """把界面上的"抢课时刻"换算成本地 epoch（按**服务端时钟**对时）。"""
+        if not self.time_enable.isChecked():
+            return None
+        from . import probe
+
+        try:
+            offset = probe.measure_clock_offset(samples=5).offset_seconds
+        except Exception as exc:  # noqa: BLE001 - 对时失败就用本地钟，但要说清楚
+            self.log_line(f"[警告] 对时失败（{type(exc).__name__}）：按本地时钟打点")
+            offset = 0.0
+        now = dt.datetime.now().astimezone()
+        picked = self.time_edit.time()
+        wall = now.replace(hour=picked.hour(), minute=picked.minute(), second=picked.second(),
+                           microsecond=0)
+        if wall.timestamp() < now.timestamp() - 30:
+            wall += dt.timedelta(days=1)       # 已过则指明天
+        return wall.timestamp() - offset
+
+    # ── 抢课 ──
+
+    def _is_busy(self) -> bool:
+        return (self._worker is not None and self._worker.isRunning()) or \
+               (self._loader is not None and self._loader.isRunning())
+
+    def start_grab(self) -> None:
+        if self._is_busy():
+            return
+        plan = self.build_plan_from_ui()
+        try:
+            plan.validate()
+        except grabconfig.ConfigError as exc:
+            QMessageBox.warning(self, "配置有误", str(exc))
+            return
+        if not plan.dry_run:
+            answer = QMessageBox.question(
+                self, "确认真实提交",
+                f"即将**真实提交** {len(plan.free_slots)} 个空闲时段的选课，会写进你的课表。\n"
+                f"重试轮数 {plan.retry_rounds}，每轮间隔 {plan.retry_interval_seconds:.0f} 秒。\n\n确认继续？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                self.log_line("[已取消] 未开始。")
+                return
+        wait_until = self.target_epoch()
+        if wait_until:
+            self.log_line(f"[等待] 目标时刻换算完成，本地对应 "
+                          f"{dt.datetime.fromtimestamp(wait_until).astimezone().isoformat(timespec='seconds')}")
+        mode = "演练（不发写请求）" if plan.dry_run else "真实提交"
+        self.log_line(f"[开始] 模式={mode}；空闲时段 {len(plan.free_slots)} 个；"
+                      f"重试 {plan.retry_rounds} 轮 × {plan.retry_interval_seconds:.0f}s")
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self._worker = GrabWorker(plan, wait_until_epoch=wait_until, client_factory=self.client_factory)
+        self._worker.progress.connect(self.log_line)
+        self._worker.finished_report.connect(self._on_report)
+        self._worker.failed.connect(self._on_grab_failed)
+        self._worker.finished.connect(self._on_worker_done)
+        self._worker.start()
+
+    def stop_grab(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self.log_line("[停止] 已请求停止（正在进行的请求会跑完）。")
+
+    def _on_worker_done(self) -> None:
+        self.btn_stop.setEnabled(False)
+        self.btn_start.setEnabled(bool(self.selected))
+
+    def _on_grab_failed(self, message: str) -> None:
+        self.log_line(f"[抢课失败] {message}")
+        QMessageBox.critical(self, "抢课失败", message[:500])
+
+    def _on_report(self, report) -> None:
+        self._results = list(report.succeeded)
+        lines = report.summary_lines()
+        self.result_text.setPlainText("\n".join(lines))
+        self.log_line("")
+        for line in lines:
+            self.log_line("  " + line)
+        self._rebuild_picks()
+        if not report.dry_run:
+            QMessageBox.information(
+                self, "抢课完成",
+                f"成功 {len(report.succeeded)} 个，失败 {len(report.failed)} 个，"
+                f"未覆盖时段 {len(report.uncovered)} 个。\n详见下方结果区。")
+
+    def _rebuild_picks(self) -> None:
+        while self.picks_layout.count():
+            item = self.picks_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.pick_boxes: list[tuple[QCheckBox, Any]] = []
+        if not self._results:
+            self.btn_cancel_picks.setEnabled(False)
+            return
+        for attempt in self._results:
+            box = QCheckBox(f"{attempt.candidate.date} {attempt.candidate.period} "
+                            f"{attempt.candidate.project_name}")
+            self.picks_layout.addWidget(box)
+            self.pick_boxes.append((box, attempt))
+        self.btn_cancel_picks.setEnabled(True)
+
+    def cancel_picked(self) -> None:
+        picked = [attempt for box, attempt in getattr(self, "pick_boxes", []) if box.isChecked()]
+        if not picked:
+            QMessageBox.information(self, "未选择", "请先勾选要退掉的条目。")
+            return
+        names = "\n".join(f"- {a.candidate.date} {a.candidate.period} {a.candidate.project_name}"
+                          for a in picked)
+        answer = QMessageBox.question(self, "确认退课",
+                                      f"即将退掉以下 {len(picked)} 条（不可撤销）：\n\n{names}\n\n确认？",
+                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            self.log_line("[已取消] 未退课。")
+            return
+        engine = runner.Runner(self.build_plan_from_ui(apply_selection=False),
+                               client=self.client_factory(), log=self.log_line)
+        try:
+            for attempt in picked:
+                ok, detail = engine.cancel_pick(attempt)
+                self.log_line(f"  {'✓' if ok else '✗'} {attempt.candidate.date} "
+                              f"{attempt.candidate.period}：{detail}")
+        finally:
+            engine.close()
+        self.log_line("复核请点「刷新场次」。")
+
+    # ── 自检（无鼠标、无真实账号）──
+
+    def self_check(self) -> int:
+        """脚本化自检：装配 → 点选 → 演练抢课 → 断言状态转移。返回 0 = 通过。"""
+        problems: list[str] = []
+
+        def expect(name: str, condition: bool, detail: str = "") -> None:
+            self.log_line(f"[{'PASS' if condition else 'FAIL'}] {name}" +
+                          (f" -- {detail}" if detail and not condition else ""))
+            if not condition:
+                problems.append(name)
+
+        # 同步加载（自检不依赖事件循环里的线程时序）
+        loader = GridLoader(self.build_plan_from_ui(apply_selection=False), self.days(),
+                            self.client_factory)
+        payload_holder: dict = {}
+        loader.loaded.connect(lambda payload: payload_holder.update(payload))
+        loader.failed.connect(lambda message: payload_holder.update({"error": message}))
+        loader.run()          # 直接同步跑，确保断言前数据就绪
+        if "error" in payload_holder:
+            expect("加载网格", False, payload_holder["error"])
+            self.log_line(f"SELF-CHECK FAILED: {problems}")
+            return 1
+        self._on_loaded(payload_holder)
+        expect("加载网格", bool(self.cells))
+
+        available = [k for k, v in self.cells.items() if v["state"] == "available"]
+        expect("存在可约单元", bool(available), f"cells={len(self.cells)}")
+        taken_cells = [k for k, v in self.cells.items() if v["state"] == "taken"]
+        expect("已有选课被标为 taken（R2 前置）", True, f"taken={len(taken_cells)}")
+
+        if available:
+            key = available[0]
+            self.toggle_cell(key)
+            expect("点选后进入已选集合", key in self.selected, str(self.selected))
+            self.toggle_cell(key)
+            expect("再点一次取消", key not in self.selected)
+            self.toggle_cell(key)
+
+        plan = self.build_plan_from_ui()
+        expect("界面装配出计划", len(plan.free_slots) == len(self.selected), str(plan))
+        expect("默认演练（不发写请求）", plan.dry_run is True, f"dry_run={plan.dry_run}")
+
+        report = runner.Runner(plan, client=self.client_factory(), log=self.log_line).run()
+        self._on_report(report)
+        expect("演练模式下没有真实成功", report.succeeded == [], str(report.succeeded))
+        expect("演练给出本应提交", len(report.would_submit) == len(plan.free_slots),
+               f"{len(report.would_submit)} vs {len(plan.free_slots)}")
+        expect("结果区有内容", bool(self.result_text.toPlainText().strip()))
+
+        # 已选实验不得出现在可约单元里（D6/R8）
+        taken_ids = set((payload_holder.get("taken") or {}).keys())
+        leaked = [k for k, v in self.cells.items()
+                  if v["state"] == "available" and str(v.get("best_slot_id")) in taken_ids]
+        expect("已做过的实验不出现在可约单元（D6）", not leaked, str(leaked))
+
+        self.log_line("")
+        if problems:
+            self.log_line(f"SELF-CHECK FAILED: {len(problems)} -> {problems}")
+            return 1
+        self.log_line("SELF-CHECK PASSED")
+        return 0
+
+
+class DemoClient:
+    """自检用的**假客户端**：不发任何网络请求，也不碰真实账号。
+
+    为什么需要它：GUI 的装配逻辑（网格状态 → 点选 → 计划 → 演练 → 结果展示）
+    在没有真实窗口与鼠标时也要能被验证；假客户端让 `--self-check` 全程可跑。
+    """
+
+    def __init__(self) -> None:
+        self.claims = {"exp": 4102444800}
+        self.submit_calls: list[str] = []
+        self.electives = [{
+            "id": 90001, "schedule_id": 4841, "project_id": 445, "schedule_status": "elected",
+            "schedules": {"date": dt.date.today().isoformat(), "periods": {"name": "上午1、2节"},
+                          "projects": {"name": "磁阻传感器与地磁场测量（519）"}},
+        }]
+
+    def prewarm(self) -> int:
+        return 5
+
+    def open_semesters(self) -> list[dict]:
+        return [{"id": 18, "name": "2026-2027-（1）", "since": "2026-08-20", "to": "2027-02-07"}]
+
+    def my_courses(self, semester_id: Any) -> list[dict]:
+        return [{"id": 71, "name": "大学物理实验Ⅰ(2)"}]
+
+    def course_projects(self, course_id: Any) -> list[dict]:
+        return [{"project_id": 475, "projects": {"name": "弗兰克-赫兹实验（520）"}},
+                {"project_id": 445, "projects": {"name": "磁阻传感器与地磁场测量（519）"}},
+                {"project_id": 448, "projects": {"name": "分压限流电路实验（543）"}}]
+
+    def _row(self, slot_id: int, date: str, period: str, project_id: int, remaining: int) -> dict:
+        return {"id": slot_id, "date": date, "periods": {"name": period},
+                "project_id": project_id, "current_student_number": 30 - remaining,
+                "max_student_number": 30, "locations": {"name": "笃行楼520"}, "projects": None}
+
+    def slots(self, course_id: Any, *, project_id: Any = None, with_my_status: bool = False) -> list[dict]:
+        today = dt.date.today()
+        day1 = (today + dt.timedelta(days=1)).isoformat()
+        day3 = (today + dt.timedelta(days=3)).isoformat()
+        table = {
+            475: [self._row(5001, day1, "下午5、6节", 475, 24),
+                  self._row(5002, day3, "上午1、2节", 475, 0)],      # 已满
+            445: [self._row(5003, day1, "上午1、2节", 445, 9)],       # 已做过该实验
+            448: [self._row(5004, day1, "晚上9，10节", 448, 15)],
+        }
+        return table.get(project_id, [])
+
+    def my_electives(self, semester_id: Any, course_id: Any = None) -> list[dict]:
+        return list(self.electives)
+
+    def submit_booking(self, slot_id: Any, course_id: Any):
+        from . import api as api_mod
+        from .models import Outcome
+
+        self.submit_calls.append(str(slot_id))
+        return api_mod.WriteResult(action="选课", target=f"lesson_id={slot_id}", http_status=200,
+                                   body_text='{"status":false,"code":200,"message":"ok"}',
+                                   ok=True, outcome=Outcome.SUCCESS, elapsed_ms=8)
+
+    def cancel_booking(self, user2project_id: Any):
+        from . import api as api_mod
+        from .models import Outcome
+
+        self.electives = [e for e in self.electives if str(e["id"]) != str(user2project_id)]
+        return api_mod.WriteResult(action="退课", target=f"user2project_id={user2project_id}",
+                                   http_status=200,
+                                   body_text='{"status":false,"code":200,"message":"ok"}',
+                                   ok=True, outcome=Outcome.SUCCESS, elapsed_ms=8)
+
+    def close(self) -> None:
+        pass
+
+
+def main(argv: list[str] | None = None) -> int:
+    """打开抢课面板；`--self-check` 用假客户端跑脚本化自检（不发网络请求）。"""
+    import sys
+
+    from PySide6.QtWidgets import QApplication
+
+    args = list(argv if argv is not None else sys.argv[1:])
+    self_check = "--self-check" in args
+    app = QApplication.instance() or QApplication([sys.argv[0]])
+    if self_check:
+        panel = GrabPanel(client_factory=DemoClient, plan_cfg=GrabPlan(dry_run=True, notify=False))
+        # 自检模式不显示窗口，也不依赖事件循环里的定时器
+        code = panel.self_check()
+        print("\n".join(panel.log.toPlainText().splitlines()[-40:]))
+        return code
+    panel = GrabPanel()
+    panel.show()
+    return app.exec()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

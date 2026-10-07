@@ -49,6 +49,8 @@ python run.py snapshot             # 只读采集：课程 → 实验项目 → 
 python run.py watch                # 余量监控：低频轮询关注场次（只读，样本逐轮落盘）
 python run.py gui                  # 图形界面：只读工作台（PySide6）
 python run.py clock                # 时钟对时：测出「服务端 − 本地」偏移（抢课打点依据）
+python run.py gui --grab           # ★ 抢课面板：两周网格点选空闲时段 → 定时刻 → 到点抢 → 结果可退课
+python run.py gui --self-check     # 抢课面板的脚本化自检（假客户端，不发网络请求、不碰账号）
 python run.py elect --list         # 选课：只读列出各课程「有余量」的场次（含余量/地点/是否已选）
 python run.py elect --course 71 --slot 4971   # **选课**（写操作；加 --dry-run 只演练）
 python run.py mine                 # 我的选课记录（含退课用的 user2project_id）

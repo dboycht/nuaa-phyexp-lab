@@ -371,14 +371,22 @@ def _cmd_watch_stop(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_gui(_args: argparse.Namespace) -> int:
-    """启动 PySide6 只读工作台。"""
+def _cmd_gui(args: argparse.Namespace) -> int:
+    """启动图形界面：默认是只读工作台；`--grab` 打开抢课面板。"""
     try:
-        from . import gui
+        if args.grab or args.self_check:
+            from . import gui_grab
+        else:
+            from . import gui
     except ImportError as exc:
         print(f"[错误] 未安装 PySide6，无法启动界面：{exc}", file=sys.stderr)
         print("       安装：pip install PySide6", file=sys.stderr)
         return 2
+    if args.grab or args.self_check:
+        argv: list[str] = []
+        if args.self_check:
+            argv.append("--self-check")
+        return gui_grab.main(argv)
     return gui.main()
 
 
@@ -1135,7 +1143,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="查看数据目录 / 会话 / 采集文件状态")
     sub.add_parser("logout", help="删除本地会话文件")
     sub.add_parser("stop", help="让正在运行的 login/recon 优雅收尾（保存 HAR 后退出）")
-    sub.add_parser("gui", help="启动图形界面（PySide6 只读工作台）")
+    p_gui = sub.add_parser("gui", help="图形界面：默认只读工作台；--grab 打开抢课面板")
+    p_gui.add_argument("--grab", action="store_true",
+                       help="打开**抢课面板**（两周网格点选空闲时段 → 到点抢 → 结果可退课）")
+    p_gui.add_argument("--self-check", action="store_true",
+                       help="抢课面板的脚本化自检（用假客户端，不发网络请求、不碰账号）")
 
     p_clock = sub.add_parser("clock", help="时钟对时：测出「服务端 − 本地」偏移")
     p_clock.add_argument("--samples", type=int, default=7, help="对时采样次数（默认 7）")
