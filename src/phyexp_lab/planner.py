@@ -263,6 +263,10 @@ def grid_cells(plan_cfg: GrabPlan, rows: list[dict], *, days: list[str],
     occupied = dict(occupied or {})
     project_names = dict(project_names or {})
     taken_ids = {str(pid) for pid in (taken_projects or {})}
+    # ⚠️ 去重口径（用户 2026-10-07 明确确认"不改"）：**只要有 elected 记录就跳过**，
+    #    不区分是否签到。虽然接口能读到考勤（`att_status`: att_y 签到 / att_n 未签到），
+    #    但用户选择不做"漏做可补抢"的细分 ⇒ 不要擅自改成按考勤判断。
+    #    （实测依据见 `docs/接口逆向.md` §3.4.2）
     cells: dict[tuple[str, str], dict] = {}
 
     for date in days:
