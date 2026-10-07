@@ -217,8 +217,8 @@ CELL_STYLES: dict[str, CellStyle] = {
     "selected": CellStyle(background=ACTIVE.primary, border=ACTIVE.primary_pressed,
                           color=ACTIVE.on_primary, hover=ACTIVE.primary_hover),
     "full": CellStyle(background=ACTIVE.surface, border=ACTIVE.border, color=ACTIVE.disabled),
-    "none": CellStyle(background=ACTIVE.disabled_soft, border=ACTIVE.border,
-                      color="#B6BEC8"),
+    "none": CellStyle(background=ACTIVE.disabled_soft, border="#EDF1F4",
+                      color="#C3CAD3"),
     "taken": CellStyle(background=ACTIVE.taken_soft, border="#DCC8F0", color=ACTIVE.taken),
     "all_taken": CellStyle(background=ACTIVE.taken_soft, border="#DCC8F0", color=ACTIVE.taken),
 }
@@ -397,11 +397,25 @@ def stylesheet() -> str:
     """
 
 
+def app_icon(size: int = 64):
+    """生成应用窗口图标：用图标字体的"实验瓶"字形画成位图。
+
+    为什么不用 `.ico` 文件：本仓库**没有也不打算引入图标二进制**（体积 + 许可），
+    而 Windows 图标字体本来就在 ⇒ 运行时画一个，零文件依赖。
+    """
+    from PySide6.QtGui import QIcon
+
+    return QIcon(icon_pixmap("lab", size, ACTIVE.primary))
+
+
 def apply_theme(app) -> None:
-    """把主题应用到 QApplication（字体 + QSS）。幂等，可重复调用。"""
+    """把主题应用到 QApplication（字体 + QSS + 窗口图标）。幂等，可重复调用。"""
     try:
         app.setFont(ui_font(10))
         app.setStyleSheet(stylesheet())
+        icon = app_icon()
+        if not icon.isNull():
+            app.setWindowIcon(icon)
     except Exception as exc:  # noqa: BLE001 - 主题失败不该让程序起不来
         print(f"[warn] 应用主题失败（{type(exc).__name__}）：{exc}")
 

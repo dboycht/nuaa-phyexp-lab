@@ -25,6 +25,7 @@ from typing import Any, Callable
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QFrame,
@@ -157,10 +158,12 @@ class GrabPanel(QDialog):
 
     def __init__(self, parent: QWidget | None = None, *,
                  client_factory: Callable[[], Any] | None = None,
-                 plan_cfg: GrabPlan | None = None) -> None:
+                 plan_cfg: GrabPlan | None = None,
+                 auto_reload: bool = True) -> None:
         super().__init__(parent)
         self.setWindowTitle("抢课面板（两周空闲时段 → 到点自动抢 → 结果可退课）")
-        self.resize(1180, 900)
+        self.resize(1180, 1000)
+        self.setMinimumSize(980, 640)   # 允许缩到小屏也能用（实测提醒：不留余量时最小高度会顶到 1053）
         self.client_factory = client_factory or (lambda: __import__(
             "phyexp_lab.api", fromlist=["PhyExpClient"]).PhyExpClient(timeout=20.0))
         self.plan_cfg = plan_cfg or GrabPlan(dry_run=True)
@@ -172,7 +175,11 @@ class GrabPanel(QDialog):
         self._results: list = []
 
         self._build_ui()
-        QTimer.singleShot(200, self.reload)
+        # ⚠️ 自检模式（auto_reload=False）**绝不能起这个定时器**：自检里一旦调用 processEvents，
+        #    它会触发 reload() → 起 QThread → 进程退出时被**非守护线程**拖住
+        #    ⇒ 整个自检看起来"挂死"（2026-10-07 实测踩到，排查代价不小）。
+        if auto_reload:
+            QTimer.singleShot(200, self.reload)
 
     # ── 界面 ──
 
@@ -219,11 +226,20 @@ class GrabPanel(QDialog):
         head_layout.addWidget(subtitle)
         root.addWidget(header)
 
-        # ── 配置卡 ──
+        # ── 配置卡：三组之间用竖线分隔（时刻 / 重试 / 安全），避免一堆控件糊在一起 ──
         box = QGroupBox("抢课设置")
         box.setFont(theme.ui_font(10, QFont.DemiBold))
         cfg_layout = QHBoxLayout(box)
         cfg_layout.setSpacing(10)
+
+        def separator() -> QFrame:
+            line = QFrame()
+            line.setFrameShape(QFrame.VLine)
+            line.setStyleSheet(f"color: {theme.ACTIVE.border}; background: {theme.ACTIVE.border};")
+            line.setFixedWidth(1)
+            return line
+
+        cfg_layout.addWidget(QLabel("目标时刻"))
         self.time_enable = QCheckBox("到点开抢")
         cfg_layout.addWidget(self.time_enable)
         self.time_edit = QTimeEdit()
@@ -231,20 +247,26 @@ class GrabPanel(QDialog):
         self.time_edit.setTime(QTime(10, 0, 0))
         self.time_edit.setFixedWidth(96)
         cfg_layout.addWidget(self.time_edit)
-        cfg_layout.addSpacing(8)
-        cfg_layout.addWidget(QLabel("重试轮数"))
+        cfg_layout.addSpacing(4)
+        cfg_layout.addWidget(separator())
+        cfg_layout.addSpacing(4)
+        cfg_layout.addWidget(QLabel("重试"))
         self.rounds_spin = QSpinBox()
         self.rounds_spin.setRange(1, 200)
         self.rounds_spin.setValue(int(self.plan_cfg.retry_rounds or 10))
         self.rounds_spin.setFixedWidth(72)
+        self.rounds_spin.setSuffix(" 轮")
         cfg_layout.addWidget(self.rounds_spin)
-        cfg_layout.addWidget(QLabel("每轮间隔(秒)"))
+        cfg_layout.addWidget(QLabel("每轮间隔"))
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(1, 600)
         self.interval_spin.setValue(int(self.plan_cfg.retry_interval_seconds or 30))
-        self.interval_spin.setFixedWidth(72)
+        self.interval_spin.setFixedWidth(80)
+        self.interval_spin.setSuffix(" 秒")
         cfg_layout.addWidget(self.interval_spin)
-        cfg_layout.addSpacing(8)
+        cfg_layout.addSpacing(4)
+        cfg_layout.addWidget(separator())
+        cfg_layout.addSpacing(4)
         self.real_check = QCheckBox("真实提交（会写进课表）")
         self.real_check.setChecked(not self.plan_cfg.dry_run)
         cfg_layout.addWidget(self.real_check)
@@ -300,8 +322,9 @@ class GrabPanel(QDialog):
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.grid_host)
         grid_outer.addWidget(scroll)
-        scroll.setMinimumHeight(300)      # 表头 + 5 个节次一次看全（实测需要约 290px）
-        root.addWidget(grid_box, 4)
+        scroll.setMinimumHeight(170)      # 允许缩小（能滚动看其余行）；窗口够大时由 stretch 自动展开
+        scroll.setMaximumHeight(560)
+        root.addWidget(grid_box, 5)
 
         # ── 结果卡 ──
         self.result_box = QGroupBox("本轮结果（勾选后可退课）")
@@ -310,17 +333,35 @@ class GrabPanel(QDialog):
         result_layout.setContentsMargins(10, 8, 10, 10)
         self.result_text = QPlainTextEdit()
         self.result_text.setReadOnly(True)
-        self.result_text.setMaximumHeight(120)
+        self.result_text.setMinimumHeight(74)
+        self.result_text.setMaximumHeight(110)
         self.result_text.setPlaceholderText(
             "还没有开始抢课。\n"
             "先在上面的网格里点选空闲时段 → 点「开始抢课」。\n"
             "默认是演练（不会真的提交）；勾选「真实提交」才会写进课表，届时会二次确认。")
         result_layout.addWidget(self.result_text)
-        bottom = QHBoxLayout()
+
+        # 抢到的条目：**可滚动的勾选列表**（条目多时不会挤成一行、也不会被截断）
+        picks_scroll = QScrollArea()
+        picks_scroll.setWidgetResizable(True)
+        picks_scroll.setMinimumHeight(44)
+        picks_scroll.setMaximumHeight(110)
+        picks_scroll.setStyleSheet(
+            f"QScrollArea {{ background: {theme.ACTIVE.surface};"
+            f" border: 1px solid {theme.ACTIVE.border}; border-radius: 8px; }}")
         self.picks_host = QWidget()
-        self.picks_layout = QHBoxLayout(self.picks_host)
-        self.picks_layout.setContentsMargins(0, 0, 0, 0)
-        bottom.addWidget(self.picks_host, 1)
+        self.picks_layout = QVBoxLayout(self.picks_host)
+        self.picks_layout.setContentsMargins(8, 6, 8, 6)
+        self.picks_layout.setSpacing(2)
+        self.picks_layout.addStretch(1)
+        picks_scroll.setWidget(self.picks_host)
+        self.picks_scroll = picks_scroll
+        result_layout.addWidget(picks_scroll)
+
+        bottom = QHBoxLayout()
+        self.picks_hint = QLabel(theme.muted("抢到的条目会列在上面，勾选后可退课"))
+        self.picks_hint.setObjectName("step")
+        bottom.addWidget(self.picks_hint, 1)
         self.btn_cancel_picks = QPushButton("退掉勾选项")
         self.btn_cancel_picks.setIcon(theme.qicon("delete", 15, theme.ACTIVE.danger))
         self.btn_cancel_picks.setObjectName("danger")
@@ -330,13 +371,38 @@ class GrabPanel(QDialog):
         result_layout.addLayout(bottom)
         root.addWidget(self.result_box, 2)
 
+        # 日志卡：标题 + 清空按钮 + **可折叠**（小屏收起来能省 ~140px，让网格更大）
+        log_box = QGroupBox("运行日志")
+        log_box.setFont(theme.ui_font(10, QFont.DemiBold))
+        log_layout = QVBoxLayout(log_box)
+        log_layout.setContentsMargins(10, 8, 10, 10)
+        log_head = QHBoxLayout()
+        self.log_visible = QCheckBox("显示日志")
+        self.log_visible.setChecked(True)
+        self.log_visible.toggled.connect(self._toggle_log)
+        log_head.addWidget(self.log_visible)
+        log_head.addStretch(1)
+        # ⚠️ 顺序：先建 self.log，再建"清空"按钮（按钮要连 self.log.clear）
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setFont(theme.monospace(9))
+        self.log.setMinimumHeight(56)
         self.log.setMaximumHeight(96)
-        root.addWidget(self.log)
+        self.btn_clear_log = QPushButton("清空日志")
+        self.btn_clear_log.setIcon(theme.qicon("undo", 14))
+        self.btn_clear_log.clicked.connect(self.log.clear)
+        log_head.addWidget(self.btn_clear_log)
+        log_layout.addLayout(log_head)
+        log_layout.addWidget(self.log)
+        self.log_box = log_box
+        root.addWidget(log_box)
 
     # ── 日志 ──
+
+    def _toggle_log(self, visible: bool) -> None:
+        """折叠/展开日志区（小屏时收起来，把空间让给网格）。"""
+        self.log.setVisible(visible)
+        self.btn_clear_log.setVisible(visible)
 
     def log_line(self, text: str) -> None:
         self.log.appendPlainText(text)
@@ -410,7 +476,30 @@ class GrabPanel(QDialog):
         days = self.days()
         weekday = "一二三四五六日"
         today = dt.date.today().isoformat()
-        for col, date in enumerate(days, start=1):
+        # 布局：0 行 = 周分组标题；1 行 = 日期；2 起 = 节次。第 8 天前插一列分隔线，
+        # 于是"本周 / 下周"一眼分得清（14 天连成一片很容易看错行）。
+        week_gap_col = 8
+        columns = [1 + index + (1 if index >= 7 else 0) for index in range(len(days))]
+
+        for week_index, (start, end, title) in enumerate(
+                ((0, 6, "本周（第 1 周）"), (7, 13, "下周（第 2 周）"))):
+            if end >= len(days):
+                continue
+            label = QLabel(title)
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet(
+                f"color: {theme.ACTIVE.primary}; background: {theme.ACTIVE.ok_soft};"
+                "border-radius: 6px; padding: 2px; font-size: 9pt;")
+            self.grid.addWidget(label, 0, columns[start], 1, end - start + 1)
+            del week_index
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.VLine)
+        separator.setStyleSheet(f"background: {theme.ACTIVE.border_strong};")
+        separator.setFixedWidth(2)
+        self.grid.addWidget(separator, 0, week_gap_col, len(PERIODS) + 2, 1)
+
+        for index, date in enumerate(days):
             day = dt.date.fromisoformat(date)
             label = QLabel(f"<b>{date[5:]}</b><br/>周{weekday[day.weekday()]}")
             label.setAlignment(Qt.AlignCenter)
@@ -418,14 +507,15 @@ class GrabPanel(QDialog):
                 f"color: {theme.ACTIVE.primary if date == today else theme.ACTIVE.text};"
                 f"background: {theme.ACTIVE.ok_soft if date == today else 'transparent'};"
                 "border-radius: 6px; padding: 3px; font-size: 9pt;")
-            self.grid.addWidget(label, 0, col)
-        for row, period in enumerate(PERIODS, start=1):
+            self.grid.addWidget(label, 1, columns[index])
+
+        for row, period in enumerate(PERIODS, start=2):
             name = QLabel(period)
             name.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             name.setStyleSheet(f"color: {theme.ACTIVE.text_muted}; font-size: 9pt;")
             name.setMinimumWidth(84)
             self.grid.addWidget(name, row, 0)
-            for col, date in enumerate(days, start=1):
+            for index, date in enumerate(days):
                 key = (date, period)
                 info = self.cells.get(key) or {"state": "none", "remaining": 0, "total": 0,
                                                "best_slot_id": None, "project_name": "", "reason": ""}
@@ -433,7 +523,7 @@ class GrabPanel(QDialog):
                 button.setCheckable(info["state"] == "available")
                 button.setChecked(key in self.selected)
                 button.setToolTip(self._button_tip(key, info))
-                button.setMinimumHeight(40)
+                button.setMinimumHeight(36)      # 36px：5 个节次在默认窗口里能一次看全（40px 会差 31px，需滚动）
                 button.setMinimumWidth(62)
                 if info["state"] == "available":
                     button.setStyleSheet(theme.cell_qss(
@@ -442,7 +532,7 @@ class GrabPanel(QDialog):
                 else:
                     button.setEnabled(False)
                     button.setStyleSheet(theme.cell_qss(info["state"]))
-                self.grid.addWidget(button, row, col)
+                self.grid.addWidget(button, row, columns[index])
                 self.buttons[key] = button
         self._update_selection_label()
 
@@ -608,12 +698,18 @@ class GrabPanel(QDialog):
         self.pick_boxes: list[tuple[QCheckBox, Any]] = []
         if not self._results:
             self.btn_cancel_picks.setEnabled(False)
+            self.picks_hint.setText("本轮没有抢到条目（失败与未覆盖原因见上方结果）")
+            self.picks_layout.addStretch(1)
             return
         for attempt in self._results:
-            box = QCheckBox(f"{attempt.candidate.date} {attempt.candidate.period} "
-                            f"{attempt.candidate.project_name}")
+            box = QCheckBox(f"{attempt.candidate.date}  {attempt.candidate.period}   "
+                            f"{attempt.candidate.project_name}   "
+                            f"{attempt.candidate.location or '-'}   "
+                            f"（slot={attempt.candidate.slot_id}）")
             self.picks_layout.addWidget(box)
             self.pick_boxes.append((box, attempt))
+        self.picks_layout.addStretch(1)
+        self.picks_hint.setText(f"本轮抢到 {len(self._results)} 条；勾选要退掉的，再点右侧按钮")
         self.btn_cancel_picks.setEnabled(True)
 
     def cancel_picked(self) -> None:
@@ -696,6 +792,44 @@ class GrabPanel(QDialog):
                   if v["state"] == "available" and str(v.get("best_slot_id")) in taken_ids]
         expect("已做过的实验不出现在可约单元（D6）", not leaked, str(leaked))
 
+        # ── 真实提交路径（用假客户端，不发网络请求）：验证"结果列表 + 可退课"这条链 ──
+        real_plan = self.build_plan_from_ui()
+        real_plan.dry_run = False
+        real_plan.retry_rounds = 1
+        real_engine = runner.Runner(real_plan, client=self.client_factory(), log=self.log_line)
+        real_report = real_engine.run()
+        self._on_report(real_report)
+        expect("真实路径产生成功条目", len(real_report.succeeded) >= 1,
+               f"succeeded={len(real_report.succeeded)} attempts={len(real_report.attempts)}")
+        expect("结果列表已生成勾选项", len(getattr(self, "pick_boxes", [])) == len(real_report.succeeded),
+               f"boxes={len(getattr(self, 'pick_boxes', []))} ok={len(real_report.succeeded)}")
+        expect("退课按钮已启用", self.btn_cancel_picks.isEnabled())
+        expect("每条都带 user2project_id", all(a.record_id is not None for a in real_report.succeeded),
+               str([a.record_id for a in real_report.succeeded]))
+
+        # 退课：直接调 cancel_pick（自检不弹确认框），并回读核实
+        if real_report.succeeded:
+            first = real_report.succeeded[0]
+            ok, detail = real_engine.cancel_pick(first)
+            expect("退课成功且回读核实", ok, detail)
+            real_engine.close()
+
+        # ── 布局真值判据（按 memory/04 §25：量"滚动区视口 vs 内容高度"，别看截图）──
+        self.show()
+        QApplication.processEvents()
+        QApplication.processEvents()
+        scroll = self.grid_host.parent().parent()
+        content_h = self.grid_host.sizeHint().height()
+        viewport_h = scroll.viewport().height()
+        expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
+               f"内容 {content_h}px > 视口 {viewport_h}px")
+        expect("结果占位区高度够放 3 行", self.result_text.height() >= 66,
+               f"高度 {self.result_text.height()}px")
+        avail_h = (self.screen() or QApplication.primaryScreen()).availableGeometry().height()
+        expect("窗口最小高度能缩进可用工作区", self.minimumSizeHint().height() < avail_h - 40,
+               f"最小 {self.minimumSizeHint().height()} vs 工作区 {avail_h}")
+        self.hide()
+
         self.log_line("")
         if problems:
             self.log_line(f"SELF-CHECK FAILED: {len(problems)} -> {problems}")
@@ -759,6 +893,19 @@ class DemoClient:
         from .models import Outcome
 
         self.submit_calls.append(str(slot_id))
+        # 模拟服务端**真的落库**：这样 runner 的"回读核实"能通过，
+        # 自检才能走到"结果列表 + 可退课"那条路径（否则只会得到 unverified）。
+        label = {"5001": ("弗兰克-赫兹实验（520）", "下午5、6节"),
+                 "5002": ("弗兰克-赫兹实验（520）", "上午1、2节"),
+                 "5004": ("分压限流电路实验（543）", "晚上9，10节")}.get(
+            str(slot_id), ("（未知实验）", "下午5、6节"))
+        day1 = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+        self.electives.append({
+            "id": 91000 + len(self.electives), "schedule_id": int(slot_id), "project_id": 475,
+            "schedule_status": "elected",
+            "schedules": {"date": day1, "periods": {"name": label[1]},
+                          "projects": {"name": label[0]}},
+        })
         return api_mod.WriteResult(action="选课", target=f"lesson_id={slot_id}", http_status=200,
                                    body_text='{"status":false,"code":200,"message":"ok"}',
                                    ok=True, outcome=Outcome.SUCCESS, elapsed_ms=8)
@@ -788,7 +935,10 @@ def main(argv: list[str] | None = None) -> int:
     app = QApplication.instance() or QApplication([sys.argv[0]])
     theme.apply_theme(app)
     if self_check:
-        panel = GrabPanel(client_factory=DemoClient, plan_cfg=GrabPlan(dry_run=True, notify=False))
+        # auto_reload=False：不装 200ms 定时器，避免自检里被非守护线程拖住（见 __init__ 的说明）
+        panel = GrabPanel(client_factory=DemoClient,
+                          plan_cfg=GrabPlan(dry_run=True, notify=False),
+                          auto_reload=False)
         # 自检模式不显示窗口，也不依赖事件循环里的定时器
         code = panel.self_check()
         print("\n".join(panel.log.toPlainText().splitlines()[-40:]))
