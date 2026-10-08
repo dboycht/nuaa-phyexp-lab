@@ -857,11 +857,17 @@ class GrabPanel(QDialog):
         #    playwright 在冻结/编译环境下会把 PLAYWRIGHT_BROWSERS_PATH 默认成 "0"
         #    （= "浏览器就在包旁边"），打包版会因此找不到 chrome.exe（2026-10-08 实测踩坑，见 ERROR.md E18）。
         browsers = session.pin_browsers_path()
-        if not session.chromium_ready():
-            self.log_line(f"[登录] 用户级浏览器目录里没有 Chromium：{browsers}")
-            if not self._ask("需要先下载 Chromium",
-                             "登录要用一个真实的浏览器内核，本机还没有。\n\n"
-                             "是否现在下载？（约 130 MB，只需一次，之后源码版/打包版共用）"):
+        channel = session.system_browser_channel()
+        if channel:
+            # Windows 10/11 自带 Edge ⇒ 别人电脑**零下载**就能登录
+            self.log_line(f"[登录] 将使用系统已安装的浏览器（{channel}），无需下载任何东西。")
+        elif not session.chromium_ready():
+            self.log_line(f"[登录] 本机既没有系统 Edge/Chrome，也没下载过自带内核：{browsers}")
+            if not self._ask("需要先下载一个浏览器内核",
+                             "登录要用一个真实的浏览器内核：\n"
+                             "  · 本机没找到系统自带的 Edge 或 Chrome；\n"
+                             "  · 需要下载一个独立内核（约 130 MB，只需一次）。\n\n"
+                             "是否现在下载？"):
                 self.log_line("[登录] 已取消（未下载浏览器）。")
                 return
             self._install_chromium_async()
@@ -1659,6 +1665,34 @@ class GrabPanel(QDialog):
         viewport_h = scroll.viewport().height()
         expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
                f"内容 {content_h}px > 视口 {viewport_h}px")
+        # ── 优先用系统浏览器（Windows 自带 Edge ⇒ 别人电脑零下载）──
+        import os as _os2
+
+        detected = session.system_browser_channel()
+        if detected:
+            # 自证：检测到的 channel 必须真的对应一个存在的可执行文件
+            exists = False
+            for channel_name, candidates in session.SYSTEM_BROWSER_CANDIDATES:
+                if channel_name != detected:
+                    continue
+                for env_var, parts in candidates:
+                    base = _os2.environ.get(env_var)
+                    if base and _os2.path.isfile(_os2.path.join(base, *parts)):
+                        exists = True
+            expect("检测到系统浏览器时，对应可执行文件确实存在",
+                   exists, f"{detected} 未找到真实 exe")
+        plan = session.browser_attempts()
+        expect("尝试顺序以系统浏览器优先、自带 Chromium 兜底",
+               plan and plan[-1] is None and (len(plan) == 1 or plan[0] == detected),
+               str(plan))
+        _os2.environ["PHYEXP_BROWSER_CHANNEL"] = "chrome"
+        expect("环境变量可强制指定内核",
+               session.browser_attempts() == ["chrome"], str(session.browser_attempts()))
+        _os2.environ["PHYEXP_BROWSER_CHANNEL"] = "chromium"
+        expect("环境变量写 chromium 时走自带内核",
+               session.browser_attempts() == [None], str(session.browser_attempts()))
+        _os2.environ.pop("PHYEXP_BROWSER_CHANNEL", None)
+
         # ── 浏览器目录必须钉到用户级（打包版登录的前置，2026-10-08 实测踩坑）──
         # 背景：playwright 检测到 frozen/编译环境时会 setdefault(PLAYWRIGHT_BROWSERS_PATH, "0")，
         # 即"浏览器就在包旁边"；本项目浏览器装用户级目录 ⇒ 不覆盖就找不到 chrome.exe。

@@ -282,6 +282,88 @@ def install_chromium(log: LogFn = _log) -> tuple[bool, str]:
     return True, "Chromium 已就绪"
 
 
+#: 系统自带/常见浏览器安装位置（Windows）。优先 Edge —— Win10/11 自带，用户**零下载**。
+#: ⚠️ 用 (环境变量名, 相对路径) 显式拼接：**不要**写 `{ProgramFiles(x86)}` 那种花括号占位符 ——
+#: `os.path.expandvars` 只认 `$VAR` / `${VAR}` / `%VAR%`，花括号会被当成字面量（实测踩过，
+#: 结果"本机明明装了 Edge 却检测为未安装"）。
+SYSTEM_BROWSER_CANDIDATES: tuple[tuple[str, tuple[tuple[str, tuple[str, ...]], ...]], ...] = (
+    ("msedge", (
+        ("ProgramFiles(x86)", ("Microsoft", "Edge", "Application", "msedge.exe")),
+        ("ProgramFiles", ("Microsoft", "Edge", "Application", "msedge.exe")),
+        ("LOCALAPPDATA", ("Microsoft", "Edge", "Application", "msedge.exe")),
+    )),
+    ("chrome", (
+        ("ProgramFiles", ("Google", "Chrome", "Application", "chrome.exe")),
+        ("ProgramFiles(x86)", ("Google", "Chrome", "Application", "chrome.exe")),
+        ("LOCALAPPDATA", ("Google", "Chrome", "Application", "chrome.exe")),
+    )),
+)
+
+
+def system_browser_channel() -> str | None:
+    """本机已安装的系统浏览器对应的 Playwright channel（`msedge` / `chrome`），没有则 None。
+
+    用**文件存在**判断而不是"启动一次试试"：界面要在起浏览器**之前**决定要不要提示下载，
+    试启动会有窗口闪现、也慢。
+    """
+    for channel, candidates in SYSTEM_BROWSER_CANDIDATES:
+        for env_var, parts in candidates:
+            base = os.environ.get(env_var)
+            if base and os.path.isfile(os.path.join(base, *parts)):
+                return channel
+    return None
+
+
+def browser_attempts() -> list[str | None]:
+    """起浏览器的**尝试顺序**（越靠前越"省事"）。
+
+    1. 环境变量 `PHYEXP_BROWSER_CHANNEL` 指定的（高级用户可强制，如 `msedge`/`chrome`/`chromium`）；
+    2. 系统已装的 Edge / Chrome —— **别人电脑不用下载任何东西**；
+    3. `None` = Playwright 自带的 Chromium（需要先下载约 130 MB，用户级目录）。
+    """
+    override = (os.environ.get("PHYEXP_BROWSER_CHANNEL") or "").strip().lower()
+    if override:
+        return [None if override in ("chromium", "bundled") else override]
+    plan: list[str | None] = []
+    channel = system_browser_channel()
+    if channel:
+        plan.append(channel)
+    plan.append(None)          # 兜底：自带 Chromium
+    return plan
+
+
+def _launch_with_best_browser(pw: Any, *, log: LogFn = _log, headless: bool = False) -> Any:
+    """按 `browser_attempts()` 依次尝试，返回第一个成功的 Browser。
+
+    为什么要这么做：Playwright 自带的 Chromium 需要先下载（~130 MB），而
+    Windows 10/11 **自带 Edge** ⇒ 优先驱动系统 Edge 就能让"别人电脑"零下载直接登录。
+    """
+    pin_browsers_path()        # 自带 Chromium 那条路要用到（见 pin_browsers_path 的注释）
+    errors: list[str] = []
+    for channel in browser_attempts():
+        label = channel or "自带的 Chromium"
+        if channel is None and not chromium_ready():
+            errors.append("自带 Chromium 未下载")
+            continue
+        try:
+            log(f"[浏览器] 使用{label}…")
+            if channel:
+                return pw.chromium.launch(headless=headless, channel=channel,
+                                          args=config.CHROMIUM_ARGS)
+            return pw.chromium.launch(headless=headless, args=config.CHROMIUM_ARGS)
+        except Exception as exc:  # noqa: BLE001 - 换下一个内核继续试
+            first = str(exc).splitlines()[0][:140]
+            errors.append(f"{label}：{first}")
+            log(f"[浏览器] {label} 不可用 —— {first}")
+    raise PlaywrightMissingError(
+        "找不到可用的浏览器内核。\n"
+        "  · Windows 自带的 Edge 通常可直接使用；若已卸载，可执行：\n"
+        "      python -m playwright install chromium\n"
+        "    （打包版会在下次点「登录」时询问是否下载，约 130 MB）\n"
+        "  细节：" + " ｜ ".join(errors)
+    )
+
+
 def interactive_login(
     *,
     record_har: bool = False,
@@ -331,7 +413,7 @@ def interactive_login(
     no_page_since: float | None = None
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=False, args=config.CHROMIUM_ARGS)
+        browser = _launch_with_best_browser(pw, log=log)
 
         context_args: dict[str, Any] = {
             "user_agent": config.USER_AGENT,
