@@ -889,7 +889,7 @@ class GrabPanel(QDialog):
     def _on_load_failed(self, message: str) -> None:
         self._set_chip(self.chip_login, "登录态：不可用", "chipDanger")
         self.log_line(f"[加载失败] {message}")
-        self.log_line("       界面保持空白（不伪造数据）；请确认已 login 且选课窗口已开。")
+        self.log_line(f"       界面保持空白（不伪造数据）；{api.login_hint()}，并确认选课窗口已开。")
         cause = short_cause(message)
         self._show_banner(
             f"当前拉取不到场次（{cause}）。"

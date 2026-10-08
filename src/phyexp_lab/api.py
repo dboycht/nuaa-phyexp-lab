@@ -36,11 +36,23 @@ import datetime as dt
 import json
 import pathlib
 import re
+import sys
 from dataclasses import dataclass
 from typing import Any
 
 from . import config, session
 from .models import Experiment, Outcome, Slot
+
+
+def login_hint() -> str:
+    """该去哪儿登录 —— 按运行方式给建议。
+
+    打包版（PyInstaller 的 EXE）里**没有 run.py 这个文件**，让用户"运行 python run.py login"
+    是给错指令；面板本身就能登录（点右上角「登录」）。日志里也**不写反引号/markdown 标记**。
+    """
+    if getattr(sys, "frozen", False):
+        return "请在面板右上角点「登录」"
+    return "请运行 python run.py login 登录一次"
 
 
 class ApiError(RuntimeError):
@@ -211,7 +223,7 @@ class PhyExpClient:
 
         token = session.load_token()
         if not token:
-            raise ApiError("缺少已保存的 token：请先运行 `python run.py login` 完成登录。")
+            raise ApiError(f"缺少已保存的 token：{login_hint()}。")
         self.claims = decode_token_claims(token)
 
         http = requests.Session()
@@ -241,10 +253,13 @@ class PhyExpClient:
 
     @staticmethod
     def paper_filename(index: int, date: str, period: str, name: str) -> str:
-        """给下载下来的 PDF 起个**人能认出来**的文件名（不依赖服务端 Content-Disposition）。
+        r"""给下载下来的 PDF 起个**人能认出来**的文件名（不依赖服务端 Content-Disposition）。
 
         例：`01_2026-10-12_下午7、8节_分光计调节与棱镜折射率的测量（531）.pdf`
         非法字符（`/ \ : * ? " < > |`）替换成 `_`，Windows 上才不会写失败。
+
+        必须是 **原始字符串形式的 docstring**（前缀字母 r + 三引号）：正文含反斜杠序列，
+        非 raw 会触发 SyntaxWarning: invalid escape sequence（打包时也会刷屏）。
         """
         raw = f"{index:02d}_{date}_{period}_{name}"
         safe = re.sub(r'[\\/:*?"<>|]+', "_", raw).strip(" .")
@@ -313,7 +328,7 @@ class PhyExpClient:
             raise ApiError(f"请求失败（{type(exc).__name__}）：{exc}") from exc
 
         if resp.status_code == 401:
-            raise ApiError("401 未授权（PostgREST 42501）：token 可能已过期，请重新运行 `python run.py login`。")
+            raise ApiError(f"401 未授权（PostgREST 42501）：token 可能已过期，{login_hint()}。")
         if resp.status_code >= 400:
             raise ApiError(f"HTTP {resp.status_code}：{(resp.text or '')[:160]}")
         try:
