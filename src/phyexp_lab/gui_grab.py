@@ -824,6 +824,24 @@ class GrabPanel(QDialog):
 
     # ── 登录 ──
 
+    def _install_chromium_async(self) -> None:
+        """后台下载 Chromium，装好后**自动继续登录**（用户不必再点一次）。"""
+        self.btn_login.setEnabled(False)
+        self.log_line("[浏览器] 开始下载 Chromium（约 130 MB）……")
+        self._installer = BrowserInstaller(self)
+        self._installer.progress.connect(self.log_line)
+        self._installer.finished_ok.connect(self._on_chromium_installed)
+        self._installer.start()
+
+    def _on_chromium_installed(self, ok: bool, detail: str) -> None:
+        self.btn_login.setEnabled(True)
+        self.log_line(f"[浏览器] {'✓' if ok else '✗'} {detail}")
+        if ok:
+            self._start_login()          # 装好了就接着登录
+        else:
+            self._warn("浏览器下载失败",
+                       f"{detail}\n\n也可以手动执行：\npython -m playwright install chromium")
+
     def _start_login(self) -> None:
         """打开登录流程（Playwright 浏览器窗口），登录成功后自动刷新网格。
 
@@ -834,6 +852,19 @@ class GrabPanel(QDialog):
 
         if getattr(self, "_login_proc", None) is not None and self._login_proc.poll() is None:
             self.log_line("[登录] 已经有一个登录窗口在运行。")
+            return
+        # ⚠️ 起浏览器之前**先钉住浏览器目录**（子进程继承本进程环境变量）：
+        #    playwright 在冻结/编译环境下会把 PLAYWRIGHT_BROWSERS_PATH 默认成 "0"
+        #    （= "浏览器就在包旁边"），打包版会因此找不到 chrome.exe（2026-10-08 实测踩坑，见 ERROR.md E18）。
+        browsers = session.pin_browsers_path()
+        if not session.chromium_ready():
+            self.log_line(f"[登录] 用户级浏览器目录里没有 Chromium：{browsers}")
+            if not self._ask("需要先下载 Chromium",
+                             "登录要用一个真实的浏览器内核，本机还没有。\n\n"
+                             "是否现在下载？（约 130 MB，只需一次，之后源码版/打包版共用）"):
+                self.log_line("[登录] 已取消（未下载浏览器）。")
+                return
+            self._install_chromium_async()
             return
         # 打包版（PyInstaller）里没有 run.py 这个文件，`sys.executable` 就是 EXE 自己
         # —— EXE 内部同样走 cli.main，所以把 `login` 子命令交回自己即可（见 packaging/entry_gui.py）。
@@ -1628,6 +1659,19 @@ class GrabPanel(QDialog):
         viewport_h = scroll.viewport().height()
         expect("默认尺寸下网格无需滚动就看全 5 个节次", content_h <= viewport_h,
                f"内容 {content_h}px > 视口 {viewport_h}px")
+        # ── 浏览器目录必须钉到用户级（打包版登录的前置，2026-10-08 实测踩坑）──
+        # 背景：playwright 检测到 frozen/编译环境时会 setdefault(PLAYWRIGHT_BROWSERS_PATH, "0")，
+        # 即"浏览器就在包旁边"；本项目浏览器装用户级目录 ⇒ 不覆盖就找不到 chrome.exe。
+        import os as _os
+
+        pinned = session.pin_browsers_path()
+        expect("浏览器目录被钉到用户级 ms-playwright",
+               str(pinned).endswith("ms-playwright")
+               and _os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == str(pinned),
+               f"{pinned} | env={_os.environ.get('PLAYWRIGHT_BROWSERS_PATH')}")
+        expect("能判断 Chromium 是否就绪（返回布尔）",
+               isinstance(session.chromium_ready(), bool), str(session.chromium_ready()))
+
         # ── 「关于」按钮（用户 2026-10-07 要求：加个关于小按钮）──
         expect("有『关于』小按钮",
                self.btn_about is not None and self.btn_about.text() == "关于",
@@ -2011,6 +2055,20 @@ class GrabPanel(QDialog):
         # 把**总项数**打在结论行里：只数输出里的 [PASS] 会被日志截断而少算（实测踩到）
         self.log_line(f"SELF-CHECK PASSED（共 {checked} 项检查）")
         return 0
+
+
+class BrowserInstaller(QThread):
+    """后台下载 Chromium（约 130 MB）—— 打包版没有 pip/playwright 命令，靠自带的 node 驱动。"""
+
+    progress = Signal(str)
+    finished_ok = Signal(bool, str)
+
+    def run(self) -> None:  # noqa: D102 - QThread 入口
+        try:
+            ok, detail = session.install_chromium(log=self.progress.emit)
+        except Exception as exc:  # noqa: BLE001 - 线程里必须自己兜异常
+            ok, detail = False, f"{type(exc).__name__}：{exc}"
+        self.finished_ok.emit(ok, detail)
 
 
 class PaperWorker(QThread):

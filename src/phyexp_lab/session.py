@@ -19,6 +19,8 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import json
+import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -208,6 +210,78 @@ def _save_session(context: Any, token: str | None, log: LogFn) -> bool:
     return saved
 
 
+# ── Playwright 浏览器目录（打包版的关键）──
+
+
+def browsers_dir() -> Path:
+    """Playwright 浏览器的**用户级**目录（源码版与打包版共用同一份，不各装一份）。"""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(base) / "ms-playwright"
+
+
+def pin_browsers_path() -> Path:
+    """把 `PLAYWRIGHT_BROWSERS_PATH` 钉到用户级目录 —— **必须在起 driver 之前调用**。
+
+    为什么必须显式钉（2026-10-08 实测踩坑）：
+    `playwright/_impl/_transport.py` 里有这么一段：
+
+        # For pyinstaller and Nuitka
+        if getattr(sys, "frozen", False) or globals().get("__compiled__"):
+            env.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+
+    —— 它**假定打包者把浏览器一起打进了包内**（`0` = "浏览器就在 playwright 包旁边"）。
+    本项目把浏览器装在用户级目录，冻结后 `0` 会指向 `_internal\\playwright\\driver\\package\\.local-browsers`
+    （里面没有 chrome.exe）⇒ 打包版点「登录」直接报
+    `BrowserType.launch: Executable doesn't exist at ...`。
+    因为用的是 `setdefault`，**我们的代码先设好这个变量就能覆盖它**。
+    """
+    target = browsers_dir()
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(target)
+    return target
+
+
+def chromium_ready() -> bool:
+    """用户级目录里是否已有可用的 Chromium（决定"要不要先下载"）。"""
+    root = browsers_dir()
+    if not root.is_dir():
+        return False
+    return any(root.glob("chromium-*/chrome-win*/chrome.exe")) or \
+        any(root.glob("chromium-*/chrome-win/chrome.exe"))
+
+
+def install_chromium(log: LogFn = _log) -> tuple[bool, str]:
+    """用**自带的 node 驱动**把 Chromium 下载到用户级目录。
+
+    为什么要自带：打包版的目标机器**没有 Python、也没有 `playwright` 这个命令**，
+    但驱动（node.exe + cli.js）就在我们包里 ⇒ 直接调它，等价于 `playwright install chromium`。
+    返回 `(是否成功, 说明)`。
+    """
+    try:
+        from playwright._impl._driver import compute_driver_executable
+    except ImportError:
+        return False, "本机没有 Playwright（源码版请先 pip install playwright）"
+    node, cli = compute_driver_executable()
+    env = dict(os.environ)
+    env["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_dir())   # 装到用户级目录
+    log(f"[浏览器] 正在下载 Chromium（约 130 MB，仅一次）→ {browsers_dir()}")
+    try:
+        proc = subprocess.run([str(node), str(cli), "install", "chromium"],
+                              env=env, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=1800)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"下载失败（{type(exc).__name__}）：{exc}"
+    for line in (proc.stdout or "").splitlines()[-6:]:
+        if line.strip():
+            log(f"[浏览器] {line.strip()}")
+    if proc.returncode != 0:
+        tail = (proc.stderr or "").strip().splitlines()[-3:]
+        return False, f"下载失败（退出码 {proc.returncode}）：{' | '.join(tail)[:200]}"
+    if not chromium_ready():
+        return False, "下载命令成功，但仍找不到 chrome.exe（请重试或手动执行 playwright install chromium）"
+    log("[浏览器] Chromium 就绪。")
+    return True, "Chromium 已就绪"
+
+
 def interactive_login(
     *,
     record_har: bool = False,
@@ -226,6 +300,10 @@ def interactive_login(
     use_saved_state:
         默认 True，把上次保存的会话带进本次浏览器（「记住我」场景下可免登录）。
     """
+    # ⚠️ 必须在起 driver **之前**钉住浏览器目录：playwright 在冻结/编译环境下会
+    #    setdefault(PLAYWRIGHT_BROWSERS_PATH, "0")（= "浏览器就在包旁边"），打包版会因此找不到
+    #    可执行文件（见 pin_browsers_path 的注释与 ERROR.md E18）。
+    pin_browsers_path()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:  # pragma: no cover - 环境相关
