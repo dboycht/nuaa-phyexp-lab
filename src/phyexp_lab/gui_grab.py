@@ -835,11 +835,18 @@ class GrabPanel(QDialog):
         if getattr(self, "_login_proc", None) is not None and self._login_proc.poll() is None:
             self.log_line("[登录] 已经有一个登录窗口在运行。")
             return
-        run_py = pathlib.Path(__file__).resolve().parents[2] / "run.py"
-        cmd = [sys.executable, str(run_py), "login", "--max-wait", "900"]
+        # 打包版（PyInstaller）里没有 run.py 这个文件，`sys.executable` 就是 EXE 自己
+        # —— EXE 内部同样走 cli.main，所以把 `login` 子命令交回自己即可（见 packaging/entry_gui.py）。
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "login", "--max-wait", "900"]
+            workdir = str(pathlib.Path(sys.executable).parent)
+        else:
+            run_py = pathlib.Path(__file__).resolve().parents[2] / "run.py"
+            cmd = [sys.executable, str(run_py), "login", "--max-wait", "900"]
+            workdir = str(run_py.parent)
         self.log_line(f"[登录] 正在打开浏览器窗口：{' '.join(cmd)}")
         try:
-            self._login_proc = subprocess.Popen(cmd, cwd=str(run_py.parent),
+            self._login_proc = subprocess.Popen(cmd, cwd=workdir,
                                                 stdout=subprocess.DEVNULL,
                                                 stderr=subprocess.DEVNULL)
         except OSError as exc:
